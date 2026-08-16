@@ -56,6 +56,24 @@ class RecipeContractTest(unittest.TestCase):
             actor_source,
         )
 
+    def test_rollout_mask_buffers_follow_vllm_sleep_lifecycle(self) -> None:
+        worker_source = (RECIPE_DIR / "worker.py").read_text()
+        rollout_body = worker_source.split("    async def rollout_mode(self):", 1)[1].split(
+            "    async def trainer_mode(self):", 1
+        )[0]
+        trainer_body = worker_source.split("    async def trainer_mode(self):", 1)[1].split(
+            "    @register", 1
+        )[0]
+
+        self.assertLess(
+            rollout_body.index("await super().rollout_mode()"),
+            rollout_body.index("set_active_buffers_available(True)"),
+        )
+        self.assertLess(
+            trainer_body.index("set_active_buffers_available(False)"),
+            trainer_body.index("await super().trainer_mode()"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

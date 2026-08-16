@@ -74,7 +74,22 @@ class MLPChannelActorRolloutRefWorker(ActorRolloutRefWorker):
         rollout_model = (
             self.rollout.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
         )
+        # super()._build_rollout() returns with vLLM in sleep mode.  The masks were
+        # installed by the class patch while the engine was awake, so this walk must
+        # only validate/reuse those buffers and must not write their CUDA storage.
         install_vllm_mlp_intervention(rollout_model, self.rollout_mlp_controller)
+
+    async def rollout_mode(self):
+        await super().rollout_mode()
+        # Weight/KV storage has been resumed, so deferred checkpoint, refresh, or
+        # route changes can now be copied into the stable graph-captured buffers.
+        self.rollout_mlp_controller.set_active_buffers_available(True)
+
+    async def trainer_mode(self):
+        # release() suspends vLLM-owned CUDA allocations.  Block controller writes
+        # before that happens; CPU mask state may continue to change while asleep.
+        self.rollout_mlp_controller.set_active_buffers_available(False)
+        await super().trainer_mode()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):

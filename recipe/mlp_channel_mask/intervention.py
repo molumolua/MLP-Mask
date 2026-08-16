@@ -2,9 +2,9 @@
 
 The controller deliberately keeps masks outside the model state dict.  vLLM active
 buffers are registered on their MLP modules before compilation/CUDA-graph capture;
-other backends may allocate them lazily.  Route switches update each buffer in place,
-so a captured graph keeps the same pointer and reads new clean/masked values without
-recapture.
+other backends may allocate them lazily.  Route switches update each available buffer
+in place (or defer the update while vLLM sleeps), so a captured graph keeps the same
+pointer and reads new clean/masked values without recapture.
 """
 
 from __future__ import annotations
@@ -86,6 +86,7 @@ class MLPChannelInterventionController:
         self._saliency_token_count: torch.Tensor | None = None
         self._saliency_accumulate_cpu_s = 0.0
         self._active_buffers: dict[tuple[int, str, int, torch.dtype, int], torch.Tensor] = {}
+        self._active_buffers_available = True
 
     @property
     def current_masked_channels(self) -> int:
@@ -208,9 +209,28 @@ class MLPChannelInterventionController:
                 f"({self.intermediate_size},) or TP-local "
                 f"({self.intermediate_size // self.tp_size},)"
             )
-        self._active_buffers[self._buffer_key(layer_idx, buffer)] = buffer
-        self._copy_route_to_buffer(layer_idx, buffer)
+        key = self._buffer_key(layer_idx, buffer)
+        # vLLM's worker enters sleep mode before the recipe gets the completed
+        # engine back.  The class-level constructor patch has already registered
+        # this exact buffer while the engine was awake; the later instance walk is
+        # validation only.  Rewriting the sleeping CUDA allocation here causes an
+        # asynchronous illegal-memory-access failure.  Keep repeat registration of
+        # the same tensor strictly read-only.
+        if self._active_buffers.get(key) is buffer:
+            return buffer
+        self._active_buffers[key] = buffer
+        if self._active_buffers_available:
+            self._copy_route_to_buffer(layer_idx, buffer)
         return buffer
+
+    def set_active_buffers_available(self, available: bool) -> None:
+        """Gate writes to buffers whose CUDA storage may be suspended by vLLM."""
+        available = bool(available)
+        if available == self._active_buffers_available:
+            return
+        self._active_buffers_available = available
+        if available:
+            self._refresh_active_buffers()
 
     def _local_slice(self, local_width: int) -> tuple[int, int]:
         if local_width == self.intermediate_size:
@@ -232,6 +252,8 @@ class MLPChannelInterventionController:
         buffer.copy_(source)
 
     def _refresh_active_buffers(self) -> None:
+        if not self._active_buffers_available:
+            return
         for key, buffer in self._active_buffers.items():
             self._copy_route_to_buffer(key[0], buffer)
 

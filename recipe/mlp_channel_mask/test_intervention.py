@@ -224,7 +224,26 @@ class MLPChannelInterventionTest(unittest.TestCase):
         controller = self._controller()
         with mock.patch.dict("sys.modules", fake_modules):
             self.assertEqual(install_vllm_class_intervention(controller), ["_FakeQwenMLP"])
-            mlp = _FakeQwenMLP(10, prefix="model.layers.0.mlp")
+            mlps = [
+                _FakeQwenMLP(10, prefix=f"model.layers.{layer_idx}.mlp")
+                for layer_idx in range(controller.num_layers)
+            ]
+
+        mlp = mlps[0]
+        model = _Model(_DenseVLLMMLP, layers=2, width=10)
+        for layer_idx, patched_mlp in enumerate(mlps):
+            model.model.layers[layer_idx].mlp = patched_mlp
+        # This is the post-construction walk performed after vLLM has entered
+        # sleep mode.  It must not refresh already registered CUDA buffers.
+        with mock.patch.object(
+            controller,
+            "_copy_route_to_buffer",
+            side_effect=AssertionError("post-build validation rewrote an active buffer"),
+        ):
+            self.assertEqual(
+                install_vllm_mlp_intervention(model, controller),
+                ["model.layers.0.mlp", "model.layers.1.mlp"],
+            )
 
         self.assertIn("_mlp_channel_active_mask", dict(mlp.named_buffers()))
         active_buffer_count = len(controller._active_buffers)
@@ -232,6 +251,37 @@ class MLPChannelInterventionTest(unittest.TestCase):
         self.assertEqual(tuple(output.shape), (2, 10))
         self.assertEqual(len(controller._active_buffers), active_buffer_count)
         self.assertIsNone(mlp.forward.__func__.__closure__)
+
+    def test_repeat_registration_of_same_vllm_buffer_is_read_only(self) -> None:
+        controller = self._controller()
+        buffer = torch.ones(10)
+        controller.register_active_buffer(0, buffer)
+
+        with mock.patch.object(
+            controller,
+            "_copy_route_to_buffer",
+            side_effect=AssertionError("repeat registration rewrote the active buffer"),
+        ):
+            returned = controller.register_active_buffer(0, buffer)
+
+        self.assertIs(returned, buffer)
+
+    def test_route_updates_are_deferred_while_vllm_buffers_are_asleep(self) -> None:
+        controller = self._controller()
+        buffer = controller.register_active_buffer(0, torch.ones(10))
+        controller.keep_mask[0, -2:] = False
+
+        controller.set_active_buffers_available(False)
+        controller.set_route(MASKED_ROUTE)
+        self.assertTrue(torch.equal(buffer, torch.ones(10)))
+
+        controller.set_active_buffers_available(True)
+        self.assertTrue(
+            torch.equal(
+                buffer,
+                torch.tensor([1, 1, 1, 1, 1, 1, 1, 1, 0, 0], dtype=torch.float32),
+            )
+        )
 
     def test_refresh_without_clean_saliency_fails_loudly(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "no clean response-token saliency"):

@@ -373,6 +373,9 @@ class DataParallelPPOActor(BasePPOActor):
 
                 ``responses``:  tensor of shape [batch_size, response_length]. torch.int64.
 
+                ``response_mask``: tensor of shape [batch_size, response_length]. Required when an MLP intervention
+                controller is installed so activation saliency is restricted to valid response tokens.
+
         Returns:
             torch.Tensor: the log_prob tensor
         """
@@ -387,8 +390,11 @@ class DataParallelPPOActor(BasePPOActor):
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
         intervention_controller = getattr(self, "intervention_controller", None)
         if intervention_controller is not None:
+            if "response_mask" not in data.batch:
+                raise RuntimeError("MLP intervention log-prob batch is missing response_mask")
             if "route_id" not in data.non_tensor_batch:
                 raise RuntimeError("MLP intervention log-prob batch is missing route_id")
+            select_keys.append("response_mask")
             non_tensor_select_keys.append("route_id")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)

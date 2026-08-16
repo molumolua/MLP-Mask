@@ -82,6 +82,7 @@ class RecipeContractTest(unittest.TestCase):
         )[0]
 
         self.assertIn("self.actor_rollout_wg.compute_log_prob(batch)", trainer_source)
+        self.assertIn('select_keys.append("response_mask")', compute_log_prob_body)
         self.assertIn('data.non_tensor_batch["route_id"]', compute_log_prob_body)
         self.assertIn("intervention_controller.set_route(route_name)", compute_log_prob_body)
 

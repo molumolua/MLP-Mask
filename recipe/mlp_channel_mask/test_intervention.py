@@ -1,0 +1,175 @@
+"""CPU unit tests for the recipe's mask/saliency primitives.
+
+Run without the training stack installed:
+    python3 -m unittest recipe.mlp_channel_mask.test_intervention
+"""
+
+from __future__ import annotations
+
+import unittest
+
+import torch
+from torch import nn
+
+from .intervention import (
+    CLEAN_ROUTE,
+    MASKED_ROUTE,
+    MLPChannelInterventionController,
+    install_hf_mlp_intervention,
+    install_vllm_mlp_intervention,
+)
+
+
+class _DenseHFMLP(nn.Module):
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.gate_proj = nn.Linear(width, width, bias=False)
+        self.up_proj = nn.Linear(width, width, bias=False)
+        self.down_proj = nn.Linear(width, width, bias=False)
+        self.act_fn = nn.SiLU()
+
+    def forward(self, hidden_state):
+        return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
+
+
+class _FusedAct(nn.Module):
+    def forward(self, gate_up):
+        gate, up = gate_up.chunk(2, dim=-1)
+        return torch.nn.functional.silu(gate) * up
+
+
+class _DenseVLLMMLP(nn.Module):
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.gate_up_proj = nn.Linear(width, 2 * width, bias=False)
+        self.down_proj = nn.Linear(width, width, bias=False)
+        self.act_fn = _FusedAct()
+
+    def forward(self, hidden_state):
+        return self.down_proj(self.act_fn(self.gate_up_proj(hidden_state)))
+
+
+class _Block(nn.Module):
+    def __init__(self, mlp: nn.Module) -> None:
+        super().__init__()
+        self.mlp = mlp
+
+
+class _Backbone(nn.Module):
+    def __init__(self, mlp_factory, layers: int, width: int) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList([_Block(mlp_factory(width)) for _ in range(layers)])
+
+
+class _Model(nn.Module):
+    def __init__(self, mlp_factory, layers: int, width: int) -> None:
+        super().__init__()
+        self.model = _Backbone(mlp_factory, layers, width)
+
+
+class MLPChannelInterventionTest(unittest.TestCase):
+    def _controller(self) -> MLPChannelInterventionController:
+        return MLPChannelInterventionController(
+            num_layers=2,
+            intermediate_size=10,
+            mask_ratio=0.20,
+            ema_beta=0.0,
+        )
+
+    def _collect(self, controller, values: torch.Tensor) -> None:
+        controller.set_route(CLEAN_ROUTE, collect_saliency=True)
+        controller.set_response_token_mask(torch.ones((1, 2)))
+        loss = torch.zeros(())
+        for layer_idx in range(controller.num_layers):
+            activation = values.reshape(1, 1, -1).expand(1, 2, -1).clone().requires_grad_(True)
+            loss = loss + controller.apply(layer_idx, activation).sum()
+        loss.backward()
+        controller.end_batch()
+
+    def test_top_ratio_is_selected_independently_in_every_block(self) -> None:
+        controller = self._controller()
+        self._collect(controller, torch.arange(1, 11, dtype=torch.float32))
+        result = controller.refresh_mask()
+
+        self.assertEqual(controller.mask_version, 1)
+        self.assertEqual((~controller.keep_mask).sum(dim=-1).tolist(), [2, 2])
+        self.assertEqual(torch.nonzero(~controller.keep_mask[0]).flatten().tolist(), [8, 9])
+        self.assertEqual(result.metrics["mlp_mask/current_channels"], 4.0)
+        self.assertEqual(result.metrics["mlp_mask/ever_unique_channels"], 4.0)
+
+        controller.set_route(MASKED_ROUTE)
+        masked = controller.apply(0, torch.ones((1, 10)))
+        self.assertTrue(torch.equal(masked[0, :8], torch.ones(8)))
+        self.assertTrue(torch.equal(masked[0, 8:], torch.zeros(2)))
+
+    def test_default_ten_percent_masks_each_block(self) -> None:
+        controller = MLPChannelInterventionController(
+            num_layers=3,
+            intermediate_size=10,
+            mask_ratio=0.10,
+            ema_beta=0.0,
+        )
+        controller.set_route(CLEAN_ROUTE, collect_saliency=True)
+        controller.set_response_token_mask(torch.ones((1, 1)))
+        loss = torch.zeros(())
+        for layer_idx in range(3):
+            activation = torch.arange(10, dtype=torch.float32).reshape(1, 1, -1).requires_grad_(True)
+            loss = loss + controller.apply(layer_idx, activation).sum()
+        loss.backward()
+        controller.end_batch()
+        controller.refresh_mask()
+        self.assertEqual((~controller.keep_mask).sum(dim=-1).tolist(), [1, 1, 1])
+
+    def test_unique_history_and_checkpoint_round_trip(self) -> None:
+        controller = self._controller()
+        self._collect(controller, torch.arange(1, 11, dtype=torch.float32))
+        controller.refresh_mask()
+        self._collect(controller, torch.arange(10, 0, -1, dtype=torch.float32))
+        result = controller.refresh_mask()
+
+        self.assertEqual(controller.current_masked_channels, 4)
+        self.assertEqual(controller.ever_masked_channels, 8)
+        self.assertEqual(result.metrics["mlp_mask/new_unique_channels"], 4.0)
+        self.assertEqual(result.metrics["mlp_mask/turnover_fraction"], 1.0)
+
+        restored = self._controller()
+        restored.load_state_dict(controller.state_dict())
+        self.assertTrue(torch.equal(restored.keep_mask, controller.keep_mask))
+        self.assertTrue(torch.equal(restored.ever_masked, controller.ever_masked))
+        self.assertTrue(torch.equal(restored.ema_saliency, controller.ema_saliency))
+        self.assertEqual(restored.mask_version, 2)
+
+    def test_dense_hf_and_vllm_instance_layouts_are_patched(self) -> None:
+        hf_controller = self._controller()
+        hf_model = _Model(_DenseHFMLP, layers=2, width=10)
+        self.assertEqual(
+            install_hf_mlp_intervention(hf_model, hf_controller),
+            ["model.layers.0.mlp", "model.layers.1.mlp"],
+        )
+
+        vllm_controller = self._controller()
+        vllm_model = _Model(_DenseVLLMMLP, layers=2, width=10)
+        self.assertEqual(
+            install_vllm_mlp_intervention(vllm_model, vllm_controller),
+            ["model.layers.0.mlp", "model.layers.1.mlp"],
+        )
+        output = vllm_model.model.layers[0].mlp(torch.randn(2, 10))
+        self.assertEqual(tuple(output.shape), (2, 10))
+
+    def test_refresh_without_clean_saliency_fails_loudly(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "no clean response-token saliency"):
+            self._controller().refresh_mask()
+
+    def test_refresh_requires_every_transformer_layer(self) -> None:
+        controller = self._controller()
+        controller.set_route(CLEAN_ROUTE, collect_saliency=True)
+        controller.set_response_token_mask(torch.ones((1, 1)))
+        activation = torch.ones((1, 1, 10), requires_grad=True)
+        controller.apply(0, activation).sum().backward()
+        controller.end_batch()
+        with self.assertRaisesRegex(RuntimeError, r"layers \[1\]"):
+            controller.refresh_mask()
+
+
+if __name__ == "__main__":
+    unittest.main()

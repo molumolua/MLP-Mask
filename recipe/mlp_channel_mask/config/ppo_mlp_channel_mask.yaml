@@ -1,0 +1,44 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+actor_rollout_ref:
+  mlp_intervention:
+    enabled: true
+    n_clean: 8
+    n_masked: 8
+    mask_ratio: 0.10
+    saliency_ema_beta: 0.95
+    warmup_steps: 1
+    refresh_freq: ${trainer.test_freq}
+
+  actor:
+    # A single PPO minibatch/epoch, while retaining vLLM behavior log-probs.
+    force_on_policy: true
+    use_rollout_log_probs: true
+
+  rollout:
+    name: vllm
+    mode: sync
+    n: 16
+    calculate_log_probs: true
+    # Explicit route-boundary resets make same-route reuse safe.
+    enable_prefix_caching: true
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  rollout_correction:
+    bypass_old_logprob_for_rollout: true
+    rollout_is: null
+    rollout_rs: null
+
+reward_model:
+  reward_manager: naive
+
+trainer:
+  project_name: MLP-Channel-Intervention

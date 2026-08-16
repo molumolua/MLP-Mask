@@ -385,37 +385,86 @@ class DataParallelPPOActor(BasePPOActor):
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        intervention_controller = getattr(self, "intervention_controller", None)
+        if intervention_controller is not None:
+            if "route_id" not in data.non_tensor_batch:
+                raise RuntimeError("MLP intervention log-prob batch is missing route_id")
+            non_tensor_select_keys.append("route_id")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
-        if use_dynamic_bsz:
-            max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
-            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
+        restore_route_order = None
+        if intervention_controller is not None:
+            # A single controller holds one structured mask at a time.  Build
+            # dynamic micro-batches independently per route, then restore the
+            # original row order after both route-specific forwards finish.
+            route_values = np.asarray(data.non_tensor_batch["route_id"], dtype=object)
+            unknown_routes = set(str(value) for value in route_values) - {"clean", "masked"}
+            if unknown_routes:
+                raise RuntimeError(f"unknown intervention routes: {sorted(unknown_routes)}")
+            route_batches = []
+            grouped_indices = []
+            for route_name in ("clean", "masked"):
+                route_indices = np.flatnonzero(route_values == route_name)
+                if route_indices.size:
+                    route_batches.append((route_name, data.select_idxs(route_indices)))
+                    grouped_indices.append(route_indices)
+            if not route_batches:
+                raise RuntimeError("MLP intervention log-prob batch contains no supported routes")
+            grouped_indices = np.concatenate(grouped_indices)
+            restore_route_order = torch.as_tensor(np.argsort(grouped_indices), dtype=torch.long)
         else:
-            micro_batches = data.split(micro_batch_size)
+            route_batches = [(None, data)]
 
-        log_probs_lst = []
-        entropy_lst = []
-        for micro_batch in micro_batches:
-            micro_batch = micro_batch.to(get_device_id())
-            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-            with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
-                )
-            log_probs_lst.append(log_probs)
+        route_log_probs = []
+        route_entropys = []
+        for route_name, route_batch in route_batches:
+            if use_dynamic_bsz:
+                max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
+                micro_batches, batch_idx_list = prepare_dynamic_batch(route_batch, max_token_len=max_token_len)
+            else:
+                micro_batches = route_batch.split(micro_batch_size)
+
+            log_probs_lst = []
+            entropy_lst = []
+            for micro_batch in micro_batches:
+                micro_batch = micro_batch.to(get_device_id())
+                model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+                if intervention_controller is not None:
+                    micro_routes = {str(value) for value in model_inputs["route_id"]}
+                    if micro_routes != {route_name}:
+                        raise RuntimeError(f"actor log-prob micro-batch mixes intervention routes: {micro_routes}")
+                    intervention_controller.set_route(route_name)
+                try:
+                    with torch.no_grad():
+                        entropy, log_probs = self._forward_micro_batch(
+                            model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                        )
+                finally:
+                    if intervention_controller is not None:
+                        intervention_controller.end_batch()
+                log_probs_lst.append(log_probs)
+                if calculate_entropy:
+                    entropy_lst.append(entropy)
+
+            log_probs = torch.concat(log_probs_lst, dim=0)
+            entropys = torch.concat(entropy_lst, dim=0) if calculate_entropy else None
+            if use_dynamic_bsz:
+                log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
+                if calculate_entropy:
+                    entropys = restore_dynamic_batch(entropys, batch_idx_list)
+            route_log_probs.append(log_probs)
             if calculate_entropy:
-                entropy_lst.append(entropy)
+                route_entropys.append(entropys)
 
-        log_probs = torch.concat(log_probs_lst, dim=0)
-        entropys = None
-        if calculate_entropy:
-            entropys = torch.concat(entropy_lst, dim=0)
+        log_probs = torch.concat(route_log_probs, dim=0)
+        entropys = torch.concat(route_entropys, dim=0) if calculate_entropy else None
 
-        if use_dynamic_bsz:
-            log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
+        if restore_route_order is not None:
+            restore_route_order = restore_route_order.to(device=log_probs.device)
+            log_probs = log_probs.index_select(0, restore_route_order)
             if calculate_entropy:
-                entropys = restore_dynamic_batch(entropys, batch_idx_list)
+                entropys = entropys.index_select(0, restore_route_order)
 
         return log_probs, entropys
 

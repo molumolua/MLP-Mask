@@ -24,6 +24,9 @@ class RecipeContractTest(unittest.TestCase):
         self.assertAlmostEqual(intervention["mask_ratio"], 0.10)
         self.assertEqual(intervention["refresh_freq"], "${trainer.test_freq}")
         self.assertTrue(rollout["enable_prefix_caching"])
+        self.assertFalse(
+            config["algorithm"]["rollout_correction"]["bypass_old_logprob_for_rollout"]
+        )
 
     def test_offline_launcher_contains_all_requested_datasets(self) -> None:
         launcher = (RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_offline.sh").read_text()
@@ -38,6 +41,10 @@ class RecipeContractTest(unittest.TestCase):
             "MMLU-Pro-Valid.parquet",
         ):
             self.assertIn(filename, launcher)
+
+    def test_offline_launcher_disables_old_logprob_bypass(self) -> None:
+        launcher = (RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_offline.sh").read_text()
+        self.assertIn("algorithm.rollout_correction.bypass_old_logprob_for_rollout=False", launcher)
 
     def test_recipe_does_not_import_another_recipe(self) -> None:
         for source_path in RECIPE_DIR.glob("*.py"):
@@ -55,6 +62,28 @@ class RecipeContractTest(unittest.TestCase):
             'response_token_mask[:, -response_length - 1 : -1] = micro_batch["response_mask"]',
             actor_source,
         )
+
+    def test_actor_update_receives_rollout_temperature(self) -> None:
+        trainer_source = (RECIPE_DIR / "trainer.py").read_text()
+        update_actor_body = trainer_source.split(
+            'with marked_timer("update_actor_dual", timing_raw, color="red"):', 1
+        )[1].split('metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))', 1)[0]
+
+        temperature_assignment = 'batch.meta_info["temperature"] = float('
+        actor_update = "self.actor_rollout_wg.update_actor(batch)"
+        self.assertIn(temperature_assignment, update_actor_body)
+        self.assertLess(update_actor_body.index(temperature_assignment), update_actor_body.index(actor_update))
+
+    def test_old_log_prob_recomputation_is_route_aware(self) -> None:
+        trainer_source = (RECIPE_DIR / "trainer.py").read_text()
+        actor_source = (WORKSPACE / "verl" / "workers" / "actor" / "dp_actor.py").read_text()
+        compute_log_prob_body = actor_source.split("    def compute_log_prob(", 1)[1].split(
+            "    @GPUMemoryLogger", 1
+        )[0]
+
+        self.assertIn("self.actor_rollout_wg.compute_log_prob(batch)", trainer_source)
+        self.assertIn('data.non_tensor_batch["route_id"]', compute_log_prob_body)
+        self.assertIn("intervention_controller.set_route(route_name)", compute_log_prob_body)
 
     def test_rollout_mask_buffers_follow_vllm_sleep_lifecycle(self) -> None:
         worker_source = (RECIPE_DIR / "worker.py").read_text()

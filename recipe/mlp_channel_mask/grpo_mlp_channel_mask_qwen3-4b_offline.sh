@@ -122,7 +122,7 @@ python3 -m recipe.mlp_channel_mask.main \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     algorithm.norm_adv_by_std_in_grpo=True \
-    algorithm.rollout_correction.bypass_old_logprob_for_rollout=True \
+    algorithm.rollout_correction.bypass_old_logprob_for_rollout=False \
     algorithm.rollout_correction.rollout_is=null \
     algorithm.rollout_correction.rollout_rs=null \
     reward_model.reward_manager=naive \

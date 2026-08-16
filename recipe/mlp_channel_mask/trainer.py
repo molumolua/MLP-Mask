@@ -12,7 +12,7 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from verl import DataProto
-from verl.trainer.ppo.core_algos import AdvantageEstimator
+from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -65,8 +65,8 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
             raise NotImplementedError("async reward functions are not supported by this focused recipe")
         if not config.actor_rollout_ref.rollout.calculate_log_probs:
             raise ValueError("vLLM calculate_log_probs must be true for route-correct behavior log-probs")
-        if not config.algorithm.rollout_correction.bypass_old_logprob_for_rollout:
-            raise ValueError("bypass_old_logprob_for_rollout must be true to avoid a route-mixed recomputation")
+        if config.algorithm.rollout_correction.bypass_old_logprob_for_rollout:
+            raise ValueError("bypass_old_logprob_for_rollout must be false so the actor recomputes old log-probs")
         if not config.actor_rollout_ref.actor.use_rollout_log_probs:
             raise ValueError("actor.use_rollout_log_probs must be true for exact clean/masked PPO ratios")
         if not config.actor_rollout_ref.actor.get("force_on_policy", False):
@@ -279,9 +279,19 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
                         policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                     )
                     if need_recomputation:
-                        raise RuntimeError("dual-route recipe forbids actor old-log-prob recomputation")
+                        with marked_timer("old_log_prob_dual", timing_raw, color="blue"):
+                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                            entropys = old_log_prob.batch["entropys"]
+                            entropy_agg = agg_loss(
+                                loss_mat=entropys,
+                                loss_mask=batch.batch["response_mask"],
+                                loss_agg_mode=self.config.actor_rollout_ref.actor.loss_agg_mode,
+                            )
+                            metrics["actor/entropy"] = entropy_agg.detach().item()
+                            old_log_prob.batch.pop("entropys")
+                            batch = batch.union(old_log_prob)
                     if "old_log_probs" not in batch.batch:
-                        raise RuntimeError("rollout did not provide route-correct old_log_probs")
+                        raise RuntimeError("actor did not provide route-correct old_log_probs")
 
                     with marked_timer("adv_dual", timing_raw, color="brown"):
                         batch.batch["token_level_scores"] = reward_tensor
@@ -309,6 +319,11 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         with marked_timer("update_actor_dual", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = False
+                            # Keep the update RPC self-contained even though the
+                            # preceding old-log-prob RPC also supplies this metadata.
+                            batch.meta_info["temperature"] = float(
+                                self.config.actor_rollout_ref.rollout.temperature
+                            )
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
 

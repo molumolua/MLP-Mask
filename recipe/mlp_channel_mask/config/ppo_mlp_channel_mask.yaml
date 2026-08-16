@@ -33,7 +33,7 @@ algorithm:
   adv_estimator: grpo
   use_kl_in_reward: false
   rollout_correction:
-    bypass_old_logprob_for_rollout: true
+    bypass_old_logprob_for_rollout: false
     rollout_is: null
     rollout_rs: null
 

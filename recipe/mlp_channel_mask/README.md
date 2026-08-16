@@ -71,7 +71,10 @@ L=\frac12L_{clean}+\frac12L_{masked}.
 
 跨 actor DP rank 的 token balancing 也按 route 分别求解：每个 rank 获得完全相同数量的 clean 样本和完全相同数量的 masked 样本，再在各自配额内平衡 token workload。这样不会因普通 length balancing 恰好把某个 rank 分成单一路径而改变目标权重。
 
-vLLM 产生的 `rollout_log_probs` 直接成为对应 route 的 `old_log_probs`。masked 样本不会用 clean actor 重新计算 behavior probability，反之亦然。
+与 DenoiseRL 一致，`bypass_old_logprob_for_rollout=false`，因此 actor 会重新计算
+`old_log_probs`。重算前按 `route_id` 拆成 clean/masked 同质 micro-batch，masked
+样本不会走 clean actor route，反之亦然。vLLM 产生的 `rollout_log_probs` 仅用于
+rollout/actor 差异诊断，不直接充当 `old_log_probs`。
 
 ## 贡献度与每层 top 10%
 

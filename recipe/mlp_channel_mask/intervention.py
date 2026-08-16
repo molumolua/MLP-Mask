@@ -550,7 +550,13 @@ def install_vllm_class_intervention(controller: MLPChannelInterventionController
 
 
 def _layer_index(module_name: str) -> int | None:
-    match = _LAYER_RE.search(module_name)
+    # FSDP1 inserts this transparent module into every auto-wrapped decoder
+    # layer, e.g. ``model.layers.0._fsdp_wrapped_module.mlp``.  Normalize the
+    # traversal-only segment before matching the underlying model layout.
+    normalized_name = ".".join(
+        part for part in module_name.split(".") if part != "_fsdp_wrapped_module"
+    )
+    match = _LAYER_RE.search(normalized_name)
     return int(match.group(1)) if match else None
 
 

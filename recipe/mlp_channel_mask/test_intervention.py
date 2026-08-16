@@ -64,6 +64,17 @@ class _Block(nn.Module):
         self.mlp = mlp
 
 
+class _FSDPWrapper(nn.Module):
+    """Dependency-free stand-in for FSDP1's named-module hierarchy."""
+
+    def __init__(self, module: nn.Module) -> None:
+        super().__init__()
+        self._fsdp_wrapped_module = module
+
+    def forward(self, *args, **kwargs):
+        return self._fsdp_wrapped_module(*args, **kwargs)
+
+
 class _Backbone(nn.Module):
     def __init__(self, mlp_factory, layers: int, width: int) -> None:
         super().__init__()
@@ -178,6 +189,21 @@ class MLPChannelInterventionTest(unittest.TestCase):
                 torch.tensor([1, 1, 1, 1, 1, 1, 1, 1, 0, 0], dtype=torch.float32),
             )
         )
+
+    def test_hf_mlp_is_found_inside_fsdp_wrapped_decoder_layers(self) -> None:
+        controller = self._controller()
+        model = _Model(_DenseHFMLP, layers=2, width=10)
+        model.model.layers = nn.ModuleList([_FSDPWrapper(layer) for layer in model.model.layers])
+
+        self.assertEqual(
+            install_hf_mlp_intervention(model, controller),
+            [
+                "model.layers.0._fsdp_wrapped_module.mlp",
+                "model.layers.1._fsdp_wrapped_module.mlp",
+            ],
+        )
+        output = model.model.layers[0]._fsdp_wrapped_module.mlp(torch.randn(2, 10))
+        self.assertEqual(tuple(output.shape), (2, 10))
 
     def test_vllm_class_patch_registers_mask_before_first_forward(self) -> None:
         vllm = ModuleType("vllm")

@@ -41,7 +41,7 @@ infer_ppo_max_token_len=$((2 * (max_prompt_length + max_response_length)))
 # Same train/test datasets as the DenoiseRL Qwen3-4B recipe.
 RAY_DATA_HOME=${RAY_DATA_HOME:-.}
 MODEL_PATH=${MODEL_PATH:-../Model/Qwen/${model_name}}
-TRAIN_FILE=${TRAIN_FILE:-./data/MATH7500.with_wrong_boxed.qwen3-4b-base.parquet}
+TRAIN_FILE=${TRAIN_FILE:-./data/MATH7500-train.parquet}
 TEST_FILE=${TEST_FILE:-'["./data/aime25_test.parquet","./data/bbeh_data.parquet","./data/MATH500-test.parquet","./data/amc23_test.parquet","./data/aime24_test.parquet","./data/MMLU-Pro-Valid.parquet"]'}
 
 project_name=${project_name:-MLP-Channel-Intervention-4B}

@@ -7,6 +7,8 @@ Run without the training stack installed:
 from __future__ import annotations
 
 import unittest
+from types import ModuleType
+from unittest import mock
 
 import torch
 from torch import nn
@@ -16,6 +18,7 @@ from .intervention import (
     MASKED_ROUTE,
     MLPChannelInterventionController,
     install_hf_mlp_intervention,
+    install_vllm_class_intervention,
     install_vllm_mlp_intervention,
 )
 
@@ -47,6 +50,12 @@ class _DenseVLLMMLP(nn.Module):
 
     def forward(self, hidden_state):
         return self.down_proj(self.act_fn(self.gate_up_proj(hidden_state)))
+
+
+class _FakeQwenMLP(_DenseVLLMMLP):
+    def __init__(self, width: int, *, prefix: str) -> None:
+        super().__init__(width)
+        self.prefix = prefix
 
 
 class _Block(nn.Module):
@@ -153,8 +162,50 @@ class MLPChannelInterventionTest(unittest.TestCase):
             install_vllm_mlp_intervention(vllm_model, vllm_controller),
             ["model.layers.0.mlp", "model.layers.1.mlp"],
         )
-        output = vllm_model.model.layers[0].mlp(torch.randn(2, 10))
+        first_mlp = vllm_model.model.layers[0].mlp
+        self.assertIn("_mlp_channel_active_mask", dict(first_mlp.named_buffers()))
+        active_buffer_count = len(vllm_controller._active_buffers)
+        output = first_mlp(torch.randn(2, 10))
         self.assertEqual(tuple(output.shape), (2, 10))
+        self.assertEqual(len(vllm_controller._active_buffers), active_buffer_count)
+        self.assertIsNone(first_mlp.forward.__func__.__closure__)
+
+        vllm_controller.keep_mask[0, -2:] = False
+        vllm_controller.set_route(MASKED_ROUTE)
+        self.assertTrue(
+            torch.equal(
+                first_mlp._mlp_channel_active_mask,
+                torch.tensor([1, 1, 1, 1, 1, 1, 1, 1, 0, 0], dtype=torch.float32),
+            )
+        )
+
+    def test_vllm_class_patch_registers_mask_before_first_forward(self) -> None:
+        vllm = ModuleType("vllm")
+        model_executor = ModuleType("vllm.model_executor")
+        models = ModuleType("vllm.model_executor.models")
+        qwen2 = ModuleType("vllm.model_executor.models.qwen2")
+        qwen3 = ModuleType("vllm.model_executor.models.qwen3")
+        qwen2.Qwen2MLP = _FakeQwenMLP
+        qwen3.Qwen3MLP = _FakeQwenMLP
+        fake_modules = {
+            "vllm": vllm,
+            "vllm.model_executor": model_executor,
+            "vllm.model_executor.models": models,
+            "vllm.model_executor.models.qwen2": qwen2,
+            "vllm.model_executor.models.qwen3": qwen3,
+        }
+
+        controller = self._controller()
+        with mock.patch.dict("sys.modules", fake_modules):
+            self.assertEqual(install_vllm_class_intervention(controller), ["_FakeQwenMLP"])
+            mlp = _FakeQwenMLP(10, prefix="model.layers.0.mlp")
+
+        self.assertIn("_mlp_channel_active_mask", dict(mlp.named_buffers()))
+        active_buffer_count = len(controller._active_buffers)
+        output = mlp(torch.randn(2, 10))
+        self.assertEqual(tuple(output.shape), (2, 10))
+        self.assertEqual(len(controller._active_buffers), active_buffer_count)
+        self.assertIsNone(mlp.forward.__func__.__closure__)
 
     def test_refresh_without_clean_saliency_fails_loudly(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "no clean response-token saliency"):

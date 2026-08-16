@@ -1,9 +1,10 @@
 """MLP-channel masks and clean-policy gradient x activation saliency.
 
-The controller deliberately keeps masks outside the model state dict.  A fixed-size
-active buffer is allocated lazily for every patched MLP.  Route switches update the
-buffer in place, which is important for vLLM CUDA graphs: the captured graph keeps the
-same pointer and reads the new clean/masked values without recapture.
+The controller deliberately keeps masks outside the model state dict.  vLLM active
+buffers are registered on their MLP modules before compilation/CUDA-graph capture;
+other backends may allocate them lazily.  Route switches update each buffer in place,
+so a captured graph keeps the same pointer and reads new clean/masked values without
+recapture.
 """
 
 from __future__ import annotations
@@ -191,8 +192,24 @@ class MLPChannelInterventionController:
         buffer = self._active_buffers.get(key)
         if buffer is None:
             buffer = torch.ones(activation.shape[-1], device=activation.device, dtype=activation.dtype)
-            self._active_buffers[key] = buffer
-            self._copy_route_to_buffer(layer_idx, buffer)
+            self.register_active_buffer(layer_idx, buffer)
+        return buffer
+
+    def register_active_buffer(self, layer_idx: int, buffer: torch.Tensor) -> torch.Tensor:
+        """Track a stable route buffer that was allocated outside model forward."""
+        if not 0 <= layer_idx < self.num_layers:
+            raise IndexError(f"layer {layer_idx} outside [0, {self.num_layers})")
+        if buffer.ndim != 1 or buffer.numel() not in {
+            self.intermediate_size,
+            self.intermediate_size // self.tp_size,
+        }:
+            raise RuntimeError(
+                f"{self.name} layer {layer_idx} active buffer has shape {tuple(buffer.shape)}, expected "
+                f"({self.intermediate_size},) or TP-local "
+                f"({self.intermediate_size // self.tp_size},)"
+            )
+        self._active_buffers[self._buffer_key(layer_idx, buffer)] = buffer
+        self._copy_route_to_buffer(layer_idx, buffer)
         return buffer
 
     def _local_slice(self, local_width: int) -> tuple[int, int]:
@@ -407,6 +424,33 @@ def install_hf_mlp_intervention(model: torch.nn.Module, controller: MLPChannelIn
     return patched
 
 
+_VLLM_ACTIVE_MASK_BUFFER = "_mlp_channel_active_mask"
+
+
+def _install_vllm_active_buffer(
+    module: torch.nn.Module,
+    controller: MLPChannelInterventionController,
+    layer_idx: int,
+) -> torch.Tensor:
+    """Create the vLLM mask before forward so Dynamo sees read-only module state."""
+    existing = module._buffers.get(_VLLM_ACTIVE_MASK_BUFFER)
+    if existing is None:
+        if hasattr(module, _VLLM_ACTIVE_MASK_BUFFER):
+            raise RuntimeError(
+                f"vLLM MLP attribute {_VLLM_ACTIVE_MASK_BUFFER!r} exists but is not a registered buffer"
+            )
+        reference = getattr(getattr(module, "down_proj", None), "weight", None)
+        if reference is None:
+            reference = next(module.parameters(), None)
+        if reference is None:
+            raise RuntimeError("cannot allocate vLLM MLP mask: module has no parameter to infer dtype/device")
+        local_width = controller.intermediate_size // controller.tp_size
+        device = None if reference.device.type == "meta" else reference.device
+        existing = torch.ones(local_width, device=device, dtype=reference.dtype)
+        module.register_buffer(_VLLM_ACTIVE_MASK_BUFFER, existing, persistent=False)
+    return controller.register_active_buffer(layer_idx, existing)
+
+
 def install_vllm_mlp_intervention(
     model: torch.nn.Module, controller: MLPChannelInterventionController
 ) -> list[str]:
@@ -422,9 +466,12 @@ def install_vllm_mlp_intervention(
         if getattr(module, "_mlp_channel_intervention_patched", False):
             if getattr(module, "_mlp_channel_intervention_controller", None) is not controller:
                 raise RuntimeError(f"vLLM MLP {name} was patched with a different controller")
+            _install_vllm_active_buffer(module, controller, layer_idx)
             patched.append(name)
             seen_layers.add(layer_idx)
             continue
+
+        _install_vllm_active_buffer(module, controller, layer_idx)
 
         def forward(this, hidden_state, *args, _layer_idx=layer_idx, **kwargs):
             if args or kwargs:
@@ -432,7 +479,7 @@ def install_vllm_mlp_intervention(
             gate_up = this.gate_up_proj(hidden_state)
             gate_up = gate_up[0] if isinstance(gate_up, tuple) else gate_up
             activation = this.act_fn(gate_up)
-            activation = controller.apply(_layer_idx, activation)
+            activation = activation * getattr(this, _VLLM_ACTIVE_MASK_BUFFER)
             output = this.down_proj(activation)
             return output[0] if isinstance(output, tuple) else output
 
@@ -485,12 +532,13 @@ def install_vllm_class_intervention(controller: MLPChannelInterventionController
             this._mlp_channel_layer_idx = layer_idx
             this._mlp_channel_intervention_patched = True
             this._mlp_channel_intervention_controller = controller
+            _install_vllm_active_buffer(this, controller, layer_idx)
 
         def patched_forward(this, hidden_state):
             gate_up = this.gate_up_proj(hidden_state)
             gate_up = gate_up[0] if isinstance(gate_up, tuple) else gate_up
             activation = this.act_fn(gate_up)
-            activation = controller.apply(this._mlp_channel_layer_idx, activation)
+            activation = activation * getattr(this, _VLLM_ACTIVE_MASK_BUFFER)
             output = this.down_proj(activation)
             return output[0] if isinstance(output, tuple) else output
 

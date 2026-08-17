@@ -193,7 +193,11 @@ class MLPChannelActorRolloutRefWorker(ActorRolloutRefWorker):
         self.rollout_mlp_controller.set_route(CLEAN_ROUTE)
         switch_elapsed = time.perf_counter() - switch_started
         output = super().generate_sequences(prompts)
-        output.meta_info.setdefault("timing", {})["mlp_mask_switch_rollout_clean"] = switch_elapsed
+        # DataProto.concat requires non-metric meta_info to be identical across
+        # rollout workers.  The parent method reduces its generation timings for
+        # that reason, so reduce the recipe-specific timing before adding it too.
+        switch_timing = reduce_timing({"mlp_mask_switch_rollout_clean": switch_elapsed})
+        output.meta_info.setdefault("timing", {}).update(switch_timing)
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

@@ -104,6 +104,18 @@ class RecipeContractTest(unittest.TestCase):
             trainer_body.index("await super().trainer_mode()"),
         )
 
+    def test_validation_switch_timing_is_reduced_before_worker_concat(self) -> None:
+        worker_source = (RECIPE_DIR / "worker.py").read_text()
+        validation_body = worker_source.rsplit("    def generate_sequences(self, prompts: DataProto):", 1)[1].split(
+            "    @register", 1
+        )[0]
+
+        reduce_call = 'reduce_timing({"mlp_mask_switch_rollout_clean": switch_elapsed})'
+        timing_update = 'output.meta_info.setdefault("timing", {}).update(switch_timing)'
+        self.assertIn(reduce_call, validation_body)
+        self.assertIn(timing_update, validation_body)
+        self.assertLess(validation_body.index(reduce_call), validation_body.index(timing_update))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,8 @@ class RecipeContractTest(unittest.TestCase):
         self.assertEqual(rollout["n"], 16)
         self.assertEqual(intervention["n_clean"] + intervention["n_masked"], rollout["n"])
         self.assertAlmostEqual(intervention["mask_ratio"], 0.10)
+        self.assertEqual(intervention["selection_strategy"], "top_saliency")
+        self.assertEqual(intervention["random_seed"], 42)
         self.assertEqual(intervention["refresh_freq"], "${trainer.test_freq}")
         self.assertTrue(rollout["enable_prefix_caching"])
         self.assertFalse(
@@ -45,6 +47,16 @@ class RecipeContractTest(unittest.TestCase):
     def test_offline_launcher_disables_old_logprob_bypass(self) -> None:
         launcher = (RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_offline.sh").read_text()
         self.assertIn("algorithm.rollout_correction.bypass_old_logprob_for_rollout=False", launcher)
+
+    def test_random_ten_percent_launcher_selects_seeded_random_masks(self) -> None:
+        launcher = (RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_random10_offline.sh").read_text()
+        base_launcher = (RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_offline.sh").read_text()
+
+        self.assertIn("selection_strategy=${selection_strategy:-random}", launcher)
+        self.assertIn("mask_ratio=${mask_ratio:-0.10}", launcher)
+        self.assertIn("random_seed=${random_seed:-42}", launcher)
+        self.assertIn("actor_rollout_ref.mlp_intervention.selection_strategy=${selection_strategy}", base_launcher)
+        self.assertIn("actor_rollout_ref.mlp_intervention.random_seed=${random_seed}", base_launcher)
 
     def test_recipe_does_not_import_another_recipe(self) -> None:
         for source_path in RECIPE_DIR.glob("*.py"):

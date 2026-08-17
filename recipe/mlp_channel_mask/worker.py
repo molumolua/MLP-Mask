@@ -50,6 +50,8 @@ class MLPChannelActorRolloutRefWorker(ActorRolloutRefWorker):
             intermediate_size=int(self.actor_model_config.intermediate_size),
             mask_ratio=float(config.get("mask_ratio", 0.10)),
             ema_beta=float(config.get("saliency_ema_beta", 0.95)),
+            selection_strategy=str(config.get("selection_strategy", "top_saliency")),
+            random_seed=int(config.get("random_seed", 42)),
             tp_rank=tp_rank,
             tp_size=tp_size,
             name=name,

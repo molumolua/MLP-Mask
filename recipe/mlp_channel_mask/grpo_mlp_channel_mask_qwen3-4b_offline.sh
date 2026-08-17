@@ -21,6 +21,8 @@ n_clean=${n_clean:-8}
 n_masked=${n_masked:-8}
 n_total=$((n_clean + n_masked))
 mask_ratio=${mask_ratio:-0.10}
+selection_strategy=${selection_strategy:-top_saliency}
+random_seed=${random_seed:-42}
 saliency_ema_beta=${saliency_ema_beta:-0.95}
 
 # GRPO schedule.
@@ -116,6 +118,8 @@ python3 -m recipe.mlp_channel_mask.main \
     actor_rollout_ref.mlp_intervention.n_clean=${n_clean} \
     actor_rollout_ref.mlp_intervention.n_masked=${n_masked} \
     actor_rollout_ref.mlp_intervention.mask_ratio=${mask_ratio} \
+    actor_rollout_ref.mlp_intervention.selection_strategy=${selection_strategy} \
+    actor_rollout_ref.mlp_intervention.random_seed=${random_seed} \
     actor_rollout_ref.mlp_intervention.saliency_ema_beta=${saliency_ema_beta} \
     actor_rollout_ref.mlp_intervention.warmup_steps=1 \
     actor_rollout_ref.mlp_intervention.refresh_freq=${test_and_save_freq} \

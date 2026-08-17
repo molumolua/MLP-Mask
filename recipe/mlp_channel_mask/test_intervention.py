@@ -17,6 +17,7 @@ from .intervention import (
     CLEAN_ROUTE,
     MASKED_ROUTE,
     MLPChannelInterventionController,
+    RANDOM_SELECTION,
     install_hf_mlp_intervention,
     install_vllm_class_intervention,
     install_vllm_mlp_intervention,
@@ -139,6 +140,33 @@ class MLPChannelInterventionTest(unittest.TestCase):
         controller.end_batch()
         controller.refresh_mask()
         self.assertEqual((~controller.keep_mask).sum(dim=-1).tolist(), [1, 1, 1])
+
+    def test_random_selection_is_exact_and_reproducible_without_saliency(self) -> None:
+        def random_controller():
+            return MLPChannelInterventionController(
+                num_layers=3,
+                intermediate_size=20,
+                mask_ratio=0.10,
+                selection_strategy=RANDOM_SELECTION,
+                random_seed=123,
+            )
+
+        first = random_controller()
+        second = random_controller()
+        first_result = first.refresh_mask()
+        second.refresh_mask()
+
+        self.assertEqual(first.mask_version, 1)
+        self.assertEqual((~first.keep_mask).sum(dim=-1).tolist(), [2, 2, 2])
+        self.assertTrue(torch.equal(first.keep_mask, second.keep_mask))
+        self.assertEqual(first_result.metrics["mlp_mask/selection_is_random"], 1.0)
+        self.assertNotIn("mlp_saliency/response_tokens", first_result.metrics)
+
+        previous_mask = first.keep_mask.clone()
+        first.refresh_mask()
+        second.refresh_mask()
+        self.assertTrue(torch.equal(first.keep_mask, second.keep_mask))
+        self.assertFalse(torch.equal(first.keep_mask, previous_mask))
 
     def test_unique_history_and_checkpoint_round_trip(self) -> None:
         controller = self._controller()

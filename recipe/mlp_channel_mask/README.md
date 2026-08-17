@@ -105,7 +105,13 @@ m_{l,j}=0\ \text{if}\ j\in\operatorname{TopK}(\bar c_l,k).
 
 所以不会出现浅层或深层垄断全局 mask 配额的情况。每层始终屏蔽相同数量的 channels。
 
-贡献度只在 `warmup_steps=1` 和之后每个 `test_freq` 对应的单个 train step 上收集。两次刷新之间不挂 activation-gradient hook，避免每一步承担 saliency reduction 成本。
+作为对照实验，也支持 `selection_strategy=random`。random 模式不计算
+gradient × activation，而是在每次 refresh 时对每一层独立、均匀地采样恰好
+`round(mask_ratio * d_ff)` 个 channels。采样使用 `random_seed + mask_version`，
+因此不同 actor worker 会得到相同 mask，同一实验可以复现，而新版本会重新采样。
+它仍保留 version 0 的全 1 warmup：第一个 train step 结束后才产生第一版随机 mask。
+
+top-saliency 模式只在 `warmup_steps=1` 和之后每个 `test_freq` 对应的单个 train step 上收集贡献度。random 模式完全不挂 activation-gradient hook，也不执行 saliency all-reduce。
 
 ## 为什么 validation 使用 clean route
 
@@ -189,6 +195,12 @@ GRPO 不使用 critic，因此不存在可正确解释的 `clean_critic/masked_c
 ```bash
 cd /Users/molu/verl-mlp_channels_mask
 bash recipe/mlp_channel_mask/grpo_mlp_channel_mask_qwen3-4b_offline.sh
+```
+
+随机屏蔽每层 10% channels 的对照实验：
+
+```bash
+bash recipe/mlp_channel_mask/grpo_mlp_channel_mask_qwen3-4b_random10_offline.sh
 ```
 
 脚本默认 `WANDB_MODE=offline`，本地记录写入 `./wandb_offline`。之后可手动执行 `wandb sync <offline-run-dir>`。

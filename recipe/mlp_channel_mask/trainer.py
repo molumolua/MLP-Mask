@@ -29,7 +29,7 @@ from verl.utils.seqlen_balancing import (
     log_seqlen_unbalance,
 )
 
-from .intervention import CLEAN_ROUTE, MASKED_ROUTE
+from .intervention import CLEAN_ROUTE, MASKED_ROUTE, RANDOM_SELECTION, TOP_SALIENCY_SELECTION
 
 
 class MLPChannelMaskTrainer(RayPPOTrainer):
@@ -76,6 +76,9 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
         refresh_freq = int(intervention.get("refresh_freq", config.trainer.test_freq))
         if refresh_freq != int(config.trainer.test_freq):
             raise ValueError("mlp_intervention.refresh_freq must equal trainer.test_freq in this recipe")
+        selection_strategy = str(intervention.get("selection_strategy", TOP_SALIENCY_SELECTION))
+        if selection_strategy not in {TOP_SALIENCY_SELECTION, RANDOM_SELECTION}:
+            raise ValueError(f"unsupported mlp_intervention.selection_strategy={selection_strategy!r}")
 
     def _build_dual_route_batch(self, batch: DataProto, mask_version: int) -> DataProto:
         intervention = self.config.actor_rollout_ref.mlp_intervention
@@ -216,6 +219,7 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
         intervention = self.config.actor_rollout_ref.mlp_intervention
         refresh_freq = int(intervention.get("refresh_freq", self.config.trainer.test_freq))
         warmup_steps = int(intervention.get("warmup_steps", 1))
+        selection_strategy = str(intervention.get("selection_strategy", TOP_SALIENCY_SELECTION))
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -240,7 +244,8 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
                 # Contribution statistics are intentionally sampled from exactly
                 # one forced-on-policy train step at each refresh boundary.  This
                 # avoids activation-gradient hooks on all intervening steps.
-                batch.meta_info["collect_mlp_saliency"] = should_refresh
+                collect_mlp_saliency = should_refresh and selection_strategy == TOP_SALIENCY_SELECTION
+                batch.meta_info["collect_mlp_saliency"] = collect_mlp_saliency
                 metrics["mlp_mask/rollout_version_used"] = float(mask_version)
                 gen_batch = self._get_gen_batch(batch)
                 gen_batch.meta_info["global_steps"] = self.global_steps
@@ -343,7 +348,7 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
 
-                metrics["mlp_saliency/collection_enabled"] = float(should_refresh)
+                metrics["mlp_saliency/collection_enabled"] = float(collect_mlp_saliency)
                 if should_refresh:
                     # Clean validation (when scheduled) intentionally happens before
                     # the new mask is selected; the refreshed mask starts next step.

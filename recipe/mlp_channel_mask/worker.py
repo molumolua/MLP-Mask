@@ -52,6 +52,7 @@ class MLPChannelActorRolloutRefWorker(ActorRolloutRefWorker):
             ema_beta=float(config.get("saliency_ema_beta", 0.95)),
             selection_strategy=str(config.get("selection_strategy", "top_saliency")),
             random_seed=int(config.get("random_seed", 42)),
+            random_scope=str(config.get("random_scope", "per_layer")),
             tp_rank=tp_rank,
             tp_size=tp_size,
             name=name,

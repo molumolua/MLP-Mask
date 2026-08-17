@@ -24,6 +24,8 @@ class RecipeContractTest(unittest.TestCase):
         self.assertAlmostEqual(intervention["mask_ratio"], 0.10)
         self.assertEqual(intervention["selection_strategy"], "top_saliency")
         self.assertEqual(intervention["random_seed"], 42)
+        self.assertEqual(intervention["random_scope"], "per_layer")
+        self.assertFalse(intervention["random_resample_every_step"])
         self.assertEqual(intervention["refresh_freq"], "${trainer.test_freq}")
         self.assertTrue(rollout["enable_prefix_caching"])
         self.assertFalse(
@@ -34,7 +36,7 @@ class RecipeContractTest(unittest.TestCase):
         launcher = (RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_offline.sh").read_text()
         self.assertIn("WANDB_MODE=${WANDB_MODE:-offline}", launcher)
         for filename in (
-            "MATH7500.with_wrong_boxed.qwen3-4b-base.parquet",
+            "MATH7500-train.parquet",
             "aime25_test.parquet",
             "bbeh_data.parquet",
             "MATH500-test.parquet",
@@ -55,8 +57,42 @@ class RecipeContractTest(unittest.TestCase):
         self.assertIn("selection_strategy=${selection_strategy:-random}", launcher)
         self.assertIn("mask_ratio=${mask_ratio:-0.10}", launcher)
         self.assertIn("random_seed=${random_seed:-42}", launcher)
+        self.assertIn("random_scope=${random_scope:-per_layer}", launcher)
         self.assertIn("actor_rollout_ref.mlp_intervention.selection_strategy=${selection_strategy}", base_launcher)
         self.assertIn("actor_rollout_ref.mlp_intervention.random_seed=${random_seed}", base_launcher)
+
+    def test_random_every_step_launcher_resamples_before_each_rollout(self) -> None:
+        launcher = (
+            RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_random10_every_step_offline.sh"
+        ).read_text()
+        base_launcher = (RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_offline.sh").read_text()
+        trainer_source = (RECIPE_DIR / "trainer.py").read_text()
+
+        self.assertIn("selection_strategy=${selection_strategy:-random}", launcher)
+        self.assertIn("mask_ratio=${mask_ratio:-0.10}", launcher)
+        self.assertIn("random_scope=${random_scope:-per_layer}", launcher)
+        self.assertIn("random_resample_every_step=${random_resample_every_step:-True}", launcher)
+        self.assertIn(
+            "actor_rollout_ref.mlp_intervention.random_resample_every_step=${random_resample_every_step}",
+            base_launcher,
+        )
+        resample = 'with marked_timer("mlp_mask_resample_driver", timing_raw, color="cyan"):'
+        build_batch = 'with marked_timer("dual_batch_build", timing_raw):'
+        self.assertIn("if random_resample_every_step:", trainer_source)
+        self.assertLess(trainer_source.index(resample), trainer_source.index(build_batch))
+        self.assertIn("should_refresh = not random_resample_every_step", trainer_source)
+
+    def test_global_random_every_step_launcher_selects_exact_global_scope(self) -> None:
+        launcher = (
+            RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_global_random10_every_step_offline.sh"
+        ).read_text()
+        base_launcher = (RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_offline.sh").read_text()
+
+        self.assertIn("selection_strategy=${selection_strategy:-random}", launcher)
+        self.assertIn("mask_ratio=${mask_ratio:-0.10}", launcher)
+        self.assertIn("random_scope=${random_scope:-global}", launcher)
+        self.assertIn("random_resample_every_step=${random_resample_every_step:-True}", launcher)
+        self.assertIn("actor_rollout_ref.mlp_intervention.random_scope=${random_scope}", base_launcher)
 
     def test_recipe_does_not_import_another_recipe(self) -> None:
         for source_path in RECIPE_DIR.glob("*.py"):

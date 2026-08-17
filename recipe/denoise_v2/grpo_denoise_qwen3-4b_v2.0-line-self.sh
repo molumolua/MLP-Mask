@@ -88,7 +88,7 @@ infer_ppo_max_token_len=$((2 * (max_prompt_length + max_response_length)))
 # selects active indices beginning with [0, train_prompt_bsz).
 RAY_DATA_HOME=${RAY_DATA_HOME:-.}
 MODEL_PATH=${MODEL_PATH:-../Model/Qwen/${model_name}}
-TRAIN_FILE=${TRAIN_FILE:-./data/MATH7500.with_wrong_boxed.qwen3-4b-base.parquet}
+TRAIN_FILE=${TRAIN_FILE:-./data/MATH7500-train.parquet}
 TEST_FILE=${TEST_FILE:-'["./data/aime25_test.parquet","./data/bbeh_data.parquet","./data/MATH500-test.parquet","./data/amc23_test.parquet","./data/aime24_test.parquet","./data/MMLU-Pro-Valid.parquet"]'}
 
 run_tag="rho${v2_initial_rho}-${v2_max_rho}_target${v2_target_accuracy}_alpha${v2_alpha}_window${v2_history_window}_slope${v2_slope_threshold}_${length_reward_tag}"

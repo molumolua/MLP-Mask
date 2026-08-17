@@ -15,6 +15,7 @@ from torch import nn
 
 from .intervention import (
     CLEAN_ROUTE,
+    GLOBAL_RANDOM_SCOPE,
     MASKED_ROUTE,
     MLPChannelInterventionController,
     RANDOM_SELECTION,
@@ -160,6 +161,7 @@ class MLPChannelInterventionTest(unittest.TestCase):
         self.assertEqual((~first.keep_mask).sum(dim=-1).tolist(), [2, 2, 2])
         self.assertTrue(torch.equal(first.keep_mask, second.keep_mask))
         self.assertEqual(first_result.metrics["mlp_mask/selection_is_random"], 1.0)
+        self.assertEqual(first_result.metrics["mlp_mask/random_scope_is_global"], 0.0)
         self.assertNotIn("mlp_saliency/response_tokens", first_result.metrics)
 
         previous_mask = first.keep_mask.clone()
@@ -167,6 +169,38 @@ class MLPChannelInterventionTest(unittest.TestCase):
         second.refresh_mask()
         self.assertTrue(torch.equal(first.keep_mask, second.keep_mask))
         self.assertFalse(torch.equal(first.keep_mask, previous_mask))
+
+    def test_global_random_selection_has_exact_total_and_variable_layer_counts(self) -> None:
+        def global_controller():
+            return MLPChannelInterventionController(
+                num_layers=4,
+                intermediate_size=5,
+                mask_ratio=0.20,
+                selection_strategy=RANDOM_SELECTION,
+                random_seed=1,
+                random_scope=GLOBAL_RANDOM_SCOPE,
+            )
+
+        first = global_controller()
+        second = global_controller()
+        result = first.refresh_mask()
+        second.refresh_mask()
+
+        self.assertEqual(first.current_masked_channels, 4)
+        self.assertEqual((~first.keep_mask).sum(dim=-1).tolist(), [1, 1, 2, 0])
+        self.assertTrue(torch.equal(first.keep_mask, second.keep_mask))
+        self.assertEqual(result.metrics["mlp_mask/current_fraction"], 0.20)
+        self.assertEqual(result.metrics["mlp_mask/random_scope_is_global"], 1.0)
+
+        per_layer = MLPChannelInterventionController(
+            num_layers=4,
+            intermediate_size=5,
+            mask_ratio=0.20,
+            selection_strategy=RANDOM_SELECTION,
+            random_seed=1,
+        )
+        with self.assertRaisesRegex(ValueError, "random_scope"):
+            per_layer.load_state_dict(first.state_dict())
 
     def test_unique_history_and_checkpoint_round_trip(self) -> None:
         controller = self._controller()

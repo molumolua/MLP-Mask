@@ -9,6 +9,7 @@ export model_name
 export selection_strategy=${selection_strategy:-random}
 export mask_ratio=${mask_ratio:-0.10}
 export random_seed=${random_seed:-42}
+export random_scope=${random_scope:-per_layer}
 export experiment_name=${experiment_name:-"grpo-${model_name}-clean8-masked8-blockrandom${mask_ratio}-seed${random_seed}"}
 
 exec bash recipe/mlp_channel_mask/grpo_mlp_channel_mask_qwen3-4b_offline.sh "$@"

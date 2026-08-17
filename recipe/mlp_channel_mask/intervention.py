@@ -24,6 +24,9 @@ _VALID_ROUTES = {CLEAN_ROUTE, MASKED_ROUTE}
 TOP_SALIENCY_SELECTION = "top_saliency"
 RANDOM_SELECTION = "random"
 _VALID_SELECTION_STRATEGIES = {TOP_SALIENCY_SELECTION, RANDOM_SELECTION}
+PER_LAYER_RANDOM_SCOPE = "per_layer"
+GLOBAL_RANDOM_SCOPE = "global"
+_VALID_RANDOM_SCOPES = {PER_LAYER_RANDOM_SCOPE, GLOBAL_RANDOM_SCOPE}
 _LAYER_RE = re.compile(r"(?:^|\.)(?:layers|h)\.(\d+)\.mlp(?:\.|$)")
 
 
@@ -38,7 +41,7 @@ class MLPChannelInterventionController:
 
     ``keep_mask[layer, channel]`` is True for an available channel and False for a
     channel removed by the structured intervention.  Masks are selected either by
-    clean policy-loss saliency or reproducible per-layer random sampling.
+    clean policy-loss saliency or reproducible per-layer/global random sampling.
     """
 
     def __init__(
@@ -50,6 +53,7 @@ class MLPChannelInterventionController:
         ema_beta: float = 0.95,
         selection_strategy: str = TOP_SALIENCY_SELECTION,
         random_seed: int = 42,
+        random_scope: str = PER_LAYER_RANDOM_SCOPE,
         tp_rank: int = 0,
         tp_size: int = 1,
         name: str = "actor",
@@ -69,6 +73,10 @@ class MLPChannelInterventionController:
             )
         if random_seed < 0:
             raise ValueError(f"random_seed must be non-negative, got {random_seed}")
+        if random_scope not in _VALID_RANDOM_SCOPES:
+            raise ValueError(f"random_scope must be one of {sorted(_VALID_RANDOM_SCOPES)}, got {random_scope!r}")
+        if selection_strategy != RANDOM_SELECTION and random_scope != PER_LAYER_RANDOM_SCOPE:
+            raise ValueError("random_scope=global requires selection_strategy=random")
         if not 0 <= tp_rank < tp_size:
             raise ValueError(f"invalid tensor-parallel rank {tp_rank}/{tp_size}")
         if intermediate_size % tp_size != 0:
@@ -82,6 +90,7 @@ class MLPChannelInterventionController:
         self.ema_beta = float(ema_beta)
         self.selection_strategy = str(selection_strategy)
         self.random_seed = int(random_seed)
+        self.random_scope = str(random_scope)
         self.tp_rank = int(tp_rank)
         self.tp_size = int(tp_size)
         self.name = str(name)
@@ -337,7 +346,7 @@ class MLPChannelInterventionController:
                     self.ema_saliency[layer_idx], k=masked_per_layer, largest=True, sorted=False
                 ).indices
                 new_keep[layer_idx, top_idx] = False
-        else:
+        elif self.random_scope == PER_LAYER_RANDOM_SCOPE:
             # Every actor worker reaches refresh with the same mask version.  A CPU
             # generator therefore produces identical masks without communication,
             # while adding mask_version resamples a new mask at every refresh.
@@ -346,6 +355,15 @@ class MLPChannelInterventionController:
             for layer_idx in range(self.num_layers):
                 random_idx = torch.randperm(self.intermediate_size, generator=generator)[:masked_per_layer]
                 new_keep[layer_idx, random_idx] = False
+        else:
+            # Sample from the flattened (layer, channel) population.  The global
+            # count is exact, while individual layers are intentionally allowed to
+            # receive different numbers of masked channels.
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(self.random_seed + self.mask_version)
+            masked_global = max(1, int(round(self.total_channels * self.mask_ratio)))
+            random_idx = torch.randperm(self.total_channels, generator=generator)[:masked_global]
+            new_keep.view(-1)[random_idx] = False
         new_masked = ~new_keep
         overlap = int((old_masked & new_masked).sum().item())
         current = int(new_masked.sum().item())
@@ -388,6 +406,7 @@ class MLPChannelInterventionController:
             "mlp_mask/version": float(self.mask_version),
             "mlp_mask/initialized": float(self.mask_version > 0),
             "mlp_mask/selection_is_random": float(self.selection_strategy == RANDOM_SELECTION),
+            "mlp_mask/random_scope_is_global": float(self.random_scope == GLOBAL_RANDOM_SCOPE),
             "mlp_mask/random_seed": float(self.random_seed),
             "mlp_mask/layers": float(self.num_layers),
             "mlp_mask/channels_per_layer": float(self.intermediate_size),
@@ -412,6 +431,7 @@ class MLPChannelInterventionController:
             "ema_beta": self.ema_beta,
             "selection_strategy": self.selection_strategy,
             "random_seed": self.random_seed,
+            "random_scope": self.random_scope,
             "keep_mask": self.keep_mask.cpu(),
             "ever_masked": self.ever_masked.cpu(),
             "ema_saliency": self.ema_saliency.cpu(),
@@ -432,6 +452,12 @@ class MLPChannelInterventionController:
             raise ValueError(
                 f"checkpoint random_seed={checkpoint_random_seed} does not match "
                 f"controller random_seed={self.random_seed}"
+            )
+        checkpoint_random_scope = str(state.get("random_scope", PER_LAYER_RANDOM_SCOPE))
+        if checkpoint_random_scope != self.random_scope:
+            raise ValueError(
+                f"checkpoint random_scope={checkpoint_random_scope!r} does not match "
+                f"controller random_scope={self.random_scope!r}"
             )
         expected = (self.num_layers, self.intermediate_size)
         keep_mask = torch.as_tensor(state["keep_mask"], dtype=torch.bool)

@@ -111,6 +111,20 @@ gradient × activation，而是在每次 refresh 时对每一层独立、均匀�
 因此不同 actor worker 会得到相同 mask，同一实验可以复现，而新版本会重新采样。
 它仍保留 version 0 的全 1 warmup：第一个 train step 结束后才产生第一版随机 mask。
 
+random 采样范围由 `random_scope` 控制：
+
+- `per_layer`：每层精确采样 `round(mask_ratio * d_ff)` 个 channels；
+- `global`：在全部 `(layer, channel)` 中精确采样
+  `round(mask_ratio * num_layers * d_ff)` 个位置，每层实际数量允许波动。
+
+两者的全模型期望比例相同；模型每层宽度一致时，`per_layer` 的总量也与 global
+基本相同，但它消除了层间采样方差。
+
+设置 `random_resample_every_step=true` 后使用另一种时序：每个 train step 的
+rollout 之前先生成一版新随机 mask，所以 step 1 就使用 `mask_version=1`，没有
+全 1 warmup。同一个 step 内 mask 保持不变，只在下一个 step 开始前再次采样。
+这个频率独立于 validation/checkpoint 的 `test_freq`。
+
 top-saliency 模式只在 `warmup_steps=1` 和之后每个 `test_freq` 对应的单个 train step 上收集贡献度。random 模式完全不挂 activation-gradient hook，也不执行 saliency all-reduce。
 
 ## 为什么 validation 使用 clean route
@@ -154,6 +168,8 @@ mask 指标：
 
 - `mlp_mask/version`：刷新后的当前版本
 - `mlp_mask/rollout_version_used`：本 step rollout 实际使用的版本
+- `mlp_mask/random_resample_every_step`：是否在每个 step 的 rollout 前随机重采样
+- `mlp_mask/random_scope_is_global`：1 表示全局随机配额，0 表示逐层配额
 - `mlp_mask/current_channels` / `current_fraction`
 - `mlp_mask/masked_per_layer_min` / `max`：用于确认 block 内配额严格平衡
 - `mlp_mask/ever_unique_channels` / `ever_unique_fraction`
@@ -203,13 +219,31 @@ bash recipe/mlp_channel_mask/grpo_mlp_channel_mask_qwen3-4b_offline.sh
 bash recipe/mlp_channel_mask/grpo_mlp_channel_mask_qwen3-4b_random10_offline.sh
 ```
 
+每个训练 step 都重新随机屏蔽每层 10% channels：
+
+```bash
+bash recipe/mlp_channel_mask/grpo_mlp_channel_mask_qwen3-4b_random10_every_step_offline.sh
+```
+
+每个训练 step 在全模型范围重新随机屏蔽精确 10% channels：
+
+```bash
+bash recipe/mlp_channel_mask/grpo_mlp_channel_mask_qwen3-4b_global_random10_every_step_offline.sh
+```
+
+若希望全局随机但只按原 refresh 周期换 mask，可运行：
+
+```bash
+random_scope=global bash recipe/mlp_channel_mask/grpo_mlp_channel_mask_qwen3-4b_random10_offline.sh
+```
+
 脚本默认 `WANDB_MODE=offline`，本地记录写入 `./wandb_offline`。之后可手动执行 `wandb sync <offline-run-dir>`。
 
 数据或模型不在默认相对路径时可覆盖：
 
 ```bash
 MODEL_PATH=/path/to/Qwen3-4B-Base \
-TRAIN_FILE=/path/to/MATH7500.with_wrong_boxed.qwen3-4b-base.parquet \
+TRAIN_FILE=/path/to/MATH7500-train.parquet \
 TEST_FILE='["/path/to/aime25_test.parquet", "/path/to/MATH500-test.parquet"]' \
 bash recipe/mlp_channel_mask/grpo_mlp_channel_mask_qwen3-4b_offline.sh
 ```

@@ -29,7 +29,14 @@ from verl.utils.seqlen_balancing import (
     log_seqlen_unbalance,
 )
 
-from .intervention import CLEAN_ROUTE, MASKED_ROUTE, RANDOM_SELECTION, TOP_SALIENCY_SELECTION
+from .intervention import (
+    CLEAN_ROUTE,
+    GLOBAL_RANDOM_SCOPE,
+    MASKED_ROUTE,
+    PER_LAYER_RANDOM_SCOPE,
+    RANDOM_SELECTION,
+    TOP_SALIENCY_SELECTION,
+)
 
 
 class MLPChannelMaskTrainer(RayPPOTrainer):
@@ -79,6 +86,16 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
         selection_strategy = str(intervention.get("selection_strategy", TOP_SALIENCY_SELECTION))
         if selection_strategy not in {TOP_SALIENCY_SELECTION, RANDOM_SELECTION}:
             raise ValueError(f"unsupported mlp_intervention.selection_strategy={selection_strategy!r}")
+        random_scope = str(intervention.get("random_scope", PER_LAYER_RANDOM_SCOPE))
+        if random_scope not in {PER_LAYER_RANDOM_SCOPE, GLOBAL_RANDOM_SCOPE}:
+            raise ValueError(f"unsupported mlp_intervention.random_scope={random_scope!r}")
+        if random_scope == GLOBAL_RANDOM_SCOPE and selection_strategy != RANDOM_SELECTION:
+            raise ValueError("mlp_intervention.random_scope=global requires selection_strategy=random")
+        random_resample_every_step = bool(intervention.get("random_resample_every_step", False))
+        if random_resample_every_step and selection_strategy != RANDOM_SELECTION:
+            raise ValueError(
+                "mlp_intervention.random_resample_every_step=true requires selection_strategy=random"
+            )
 
     def _build_dual_route_batch(self, batch: DataProto, mask_version: int) -> DataProto:
         intervention = self.config.actor_rollout_ref.mlp_intervention
@@ -220,11 +237,13 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
         refresh_freq = int(intervention.get("refresh_freq", self.config.trainer.test_freq))
         warmup_steps = int(intervention.get("warmup_steps", 1))
         selection_strategy = str(intervention.get("selection_strategy", TOP_SALIENCY_SELECTION))
+        random_resample_every_step = bool(intervention.get("random_resample_every_step", False))
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics: dict[str, float] = {}
                 timing_raw: dict[str, float] = {}
+                metrics["mlp_mask/random_resample_every_step"] = float(random_resample_every_step)
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
                         not prev_step_profile and curr_step_profile
@@ -232,14 +251,27 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
                         else curr_step_profile
                     )
 
+                if random_resample_every_step:
+                    # Random masks need no backward statistics.  Resample before
+                    # building the batch so step 1 is masked too, then keep this
+                    # version fixed for rollout, old-logprob, and actor update.
+                    with marked_timer("mlp_mask_resample_driver", timing_raw, color="cyan"):
+                        mask_version = self._refresh_mask(metrics, timing_raw)
+                    current_mask_metrics = {
+                        key: value
+                        for key, value in metrics.items()
+                        if key.startswith("mlp_mask/") and key != "mlp_mask/rollout_version_used"
+                    }
+
                 with marked_timer("dual_batch_build", timing_raw):
                     base_batch = DataProto.from_single_dict(batch_dict)
                     base_batch.non_tensor_batch["uid"] = np.asarray(
                         [str(uuid.uuid4()) for _ in range(len(base_batch.batch))], dtype=object
                     )
                     batch = self._build_dual_route_batch(base_batch, mask_version=mask_version)
-                should_refresh = self.global_steps == warmup_steps or (
-                    refresh_freq > 0 and self.global_steps % refresh_freq == 0
+                should_refresh = not random_resample_every_step and (
+                    self.global_steps == warmup_steps
+                    or (refresh_freq > 0 and self.global_steps % refresh_freq == 0)
                 )
                 # Contribution statistics are intentionally sampled from exactly
                 # one forced-on-policy train step at each refresh boundary.  This

@@ -14,6 +14,8 @@ actor_rollout_ref:
     mask_ratio: 0.10
     selection_strategy: top_saliency
     random_seed: 42
+    random_scope: per_layer
+    random_resample_every_step: false
     saliency_ema_beta: 0.95
     warmup_steps: 1
     refresh_freq: ${trainer.test_freq}

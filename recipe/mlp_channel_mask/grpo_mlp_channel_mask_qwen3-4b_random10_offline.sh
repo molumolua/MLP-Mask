@@ -7,7 +7,7 @@ set -euo pipefail
 model_name=${model_name:-Qwen3-4B-Base}
 export model_name
 export selection_strategy=${selection_strategy:-random}
-export mask_ratio=${mask_ratio:-0.10}
+export mask_ratio=${mask_ratio:-0.01}
 export random_seed=${random_seed:-42}
 export random_scope=${random_scope:-per_layer}
 export experiment_name=${experiment_name:-"grpo-${model_name}-clean8-masked8-blockrandom${mask_ratio}-seed${random_seed}"}

@@ -18,6 +18,7 @@ venv/
 .idea/
 .vscode/
 data/
+ckpts/
 
 # Runtime output
 *.log

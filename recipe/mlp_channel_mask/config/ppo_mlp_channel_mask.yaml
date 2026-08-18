@@ -15,7 +15,10 @@ actor_rollout_ref:
     selection_strategy: top_saliency
     random_seed: 42
     random_scope: per_layer
+    weighted_max_ratio: 4.0
+    weighted_rank_power: 2.0
     random_resample_every_step: false
+    saliency_update_every_step: false
     saliency_ema_beta: 0.95
     warmup_steps: 1
     refresh_freq: ${trainer.test_freq}

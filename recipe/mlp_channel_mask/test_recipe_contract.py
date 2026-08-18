@@ -25,7 +25,10 @@ class RecipeContractTest(unittest.TestCase):
         self.assertEqual(intervention["selection_strategy"], "top_saliency")
         self.assertEqual(intervention["random_seed"], 42)
         self.assertEqual(intervention["random_scope"], "per_layer")
+        self.assertEqual(intervention["weighted_max_ratio"], 4.0)
+        self.assertEqual(intervention["weighted_rank_power"], 2.0)
         self.assertFalse(intervention["random_resample_every_step"])
+        self.assertFalse(intervention["saliency_update_every_step"])
         self.assertEqual(intervention["refresh_freq"], "${trainer.test_freq}")
         self.assertTrue(rollout["enable_prefix_caching"])
         self.assertFalse(
@@ -50,12 +53,12 @@ class RecipeContractTest(unittest.TestCase):
         launcher = (RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_offline.sh").read_text()
         self.assertIn("algorithm.rollout_correction.bypass_old_logprob_for_rollout=False", launcher)
 
-    def test_random_ten_percent_launcher_selects_seeded_random_masks(self) -> None:
+    def test_periodic_random_launcher_selects_seeded_one_percent_masks(self) -> None:
         launcher = (RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_random10_offline.sh").read_text()
         base_launcher = (RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_offline.sh").read_text()
 
         self.assertIn("selection_strategy=${selection_strategy:-random}", launcher)
-        self.assertIn("mask_ratio=${mask_ratio:-0.10}", launcher)
+        self.assertIn("mask_ratio=${mask_ratio:-0.01}", launcher)
         self.assertIn("random_seed=${random_seed:-42}", launcher)
         self.assertIn("random_scope=${random_scope:-per_layer}", launcher)
         self.assertIn("actor_rollout_ref.mlp_intervention.selection_strategy=${selection_strategy}", base_launcher)
@@ -93,6 +96,43 @@ class RecipeContractTest(unittest.TestCase):
         self.assertIn("random_scope=${random_scope:-global}", launcher)
         self.assertIn("random_resample_every_step=${random_resample_every_step:-True}", launcher)
         self.assertIn("actor_rollout_ref.mlp_intervention.random_scope=${random_scope}", base_launcher)
+
+    def test_weighted_random_launcher_uses_fixed_per_layer_weights(self) -> None:
+        launcher = (
+            RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_weighted_random10_every_step_offline.sh"
+        ).read_text()
+        base_launcher = (RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_offline.sh").read_text()
+        trainer_source = (RECIPE_DIR / "trainer.py").read_text()
+
+        self.assertIn("selection_strategy=${selection_strategy:-weighted_random}", launcher)
+        self.assertIn("mask_ratio=${mask_ratio:-0.10}", launcher)
+        self.assertIn("random_scope=${random_scope:-per_layer}", launcher)
+        self.assertIn("weighted_max_ratio=${weighted_max_ratio:-4.0}", launcher)
+        self.assertIn("weighted_rank_power=${weighted_rank_power:-2.0}", launcher)
+        self.assertIn("random_resample_every_step=${random_resample_every_step:-True}", launcher)
+        self.assertIn("saliency_update_every_step=${saliency_update_every_step:-True}", launcher)
+        self.assertIn("saliency_ema_beta=${saliency_ema_beta:-0.0}", launcher)
+        self.assertNotIn("weighted_warmup", launcher)
+        self.assertNotIn("weighted_warmup", base_launcher)
+        self.assertIn(
+            "actor_rollout_ref.mlp_intervention.weighted_max_ratio=${weighted_max_ratio}",
+            base_launcher,
+        )
+        self.assertIn(
+            "actor_rollout_ref.mlp_intervention.weighted_rank_power=${weighted_rank_power}",
+            base_launcher,
+        )
+        self.assertIn(
+            "actor_rollout_ref.mlp_intervention.saliency_update_every_step=${saliency_update_every_step}",
+            base_launcher,
+        )
+        self.assertIn("WEIGHTED_RANDOM_SELECTION", trainer_source)
+        self.assertIn("mask_prepared_for_current_step", trainer_source)
+        self.assertIn(
+            "saliency_update_due = saliency_update_every_step or saliency_refresh_due",
+            trainer_source,
+        )
+        self.assertIn('timing_raw["mlp_saliency_enabled_actor_update"]', trainer_source)
 
     def test_recipe_does_not_import_another_recipe(self) -> None:
         for source_path in RECIPE_DIR.glob("*.py"):

@@ -23,7 +23,12 @@ MASKED_ROUTE = "masked"
 _VALID_ROUTES = {CLEAN_ROUTE, MASKED_ROUTE}
 TOP_SALIENCY_SELECTION = "top_saliency"
 RANDOM_SELECTION = "random"
-_VALID_SELECTION_STRATEGIES = {TOP_SALIENCY_SELECTION, RANDOM_SELECTION}
+WEIGHTED_RANDOM_SELECTION = "weighted_random"
+_VALID_SELECTION_STRATEGIES = {
+    TOP_SALIENCY_SELECTION,
+    RANDOM_SELECTION,
+    WEIGHTED_RANDOM_SELECTION,
+}
 PER_LAYER_RANDOM_SCOPE = "per_layer"
 GLOBAL_RANDOM_SCOPE = "global"
 _VALID_RANDOM_SCOPES = {PER_LAYER_RANDOM_SCOPE, GLOBAL_RANDOM_SCOPE}
@@ -54,6 +59,8 @@ class MLPChannelInterventionController:
         selection_strategy: str = TOP_SALIENCY_SELECTION,
         random_seed: int = 42,
         random_scope: str = PER_LAYER_RANDOM_SCOPE,
+        weighted_max_ratio: float = 4.0,
+        weighted_rank_power: float = 2.0,
         tp_rank: int = 0,
         tp_size: int = 1,
         name: str = "actor",
@@ -74,9 +81,15 @@ class MLPChannelInterventionController:
         if random_seed < 0:
             raise ValueError(f"random_seed must be non-negative, got {random_seed}")
         if random_scope not in _VALID_RANDOM_SCOPES:
-            raise ValueError(f"random_scope must be one of {sorted(_VALID_RANDOM_SCOPES)}, got {random_scope!r}")
+            raise ValueError(
+                f"random_scope must be one of {sorted(_VALID_RANDOM_SCOPES)}, got {random_scope!r}"
+            )
         if selection_strategy != RANDOM_SELECTION and random_scope != PER_LAYER_RANDOM_SCOPE:
             raise ValueError("random_scope=global requires selection_strategy=random")
+        if weighted_max_ratio < 1.0:
+            raise ValueError(f"weighted_max_ratio must be >= 1, got {weighted_max_ratio}")
+        if weighted_rank_power <= 0.0:
+            raise ValueError(f"weighted_rank_power must be positive, got {weighted_rank_power}")
         if not 0 <= tp_rank < tp_size:
             raise ValueError(f"invalid tensor-parallel rank {tp_rank}/{tp_size}")
         if intermediate_size % tp_size != 0:
@@ -91,6 +104,8 @@ class MLPChannelInterventionController:
         self.selection_strategy = str(selection_strategy)
         self.random_seed = int(random_seed)
         self.random_scope = str(random_scope)
+        self.weighted_max_ratio = float(weighted_max_ratio)
+        self.weighted_rank_power = float(weighted_rank_power)
         self.tp_rank = int(tp_rank)
         self.tp_size = int(tp_size)
         self.name = str(name)
@@ -128,8 +143,11 @@ class MLPChannelInterventionController:
             raise ValueError(f"route must be one of {_VALID_ROUTES}, got {route!r}")
         if collect_saliency and route != CLEAN_ROUTE:
             raise ValueError("saliency may only be collected on the clean route")
-        if collect_saliency and self.selection_strategy != TOP_SALIENCY_SELECTION:
-            raise ValueError("saliency collection is only valid for top_saliency selection")
+        if collect_saliency and self.selection_strategy not in {
+            TOP_SALIENCY_SELECTION,
+            WEIGHTED_RANDOM_SELECTION,
+        }:
+            raise ValueError("saliency collection requires top_saliency or weighted_random selection")
         self.route = route
         self.collect_saliency = bool(collect_saliency)
         self._response_token_mask = None
@@ -287,7 +305,14 @@ class MLPChannelInterventionController:
         refresh_started = time.perf_counter()
         reduce_elapsed = 0.0
         saliency_metrics: dict[str, float] = {}
-        if self.selection_strategy == TOP_SALIENCY_SELECTION:
+        uses_saliency = self.selection_strategy in {
+            TOP_SALIENCY_SELECTION,
+            WEIGHTED_RANDOM_SELECTION,
+        }
+        has_pending_saliency = self._saliency_token_count is not None or bool(self._saliency_sum)
+        if uses_saliency and (
+            self.selection_strategy == TOP_SALIENCY_SELECTION or has_pending_saliency
+        ):
             device = self._score_device()
             saliency = torch.stack(
                 [
@@ -333,6 +358,16 @@ class MLPChannelInterventionController:
                 "mlp_saliency/min": float(self.ema_saliency.min().item()),
                 "mlp_saliency/response_tokens": float(token_count.item()),
                 "mlp_saliency/layers_observed": float((observed_layers > 0).sum().item()),
+                "mlp_saliency/updated_on_refresh": 1.0,
+            }
+        elif self.selection_strategy == WEIGHTED_RANDOM_SELECTION:
+            saliency_metrics = {
+                "mlp_saliency/mean": float(self.ema_saliency.mean().item()),
+                "mlp_saliency/max": float(self.ema_saliency.max().item()),
+                "mlp_saliency/min": float(self.ema_saliency.min().item()),
+                "mlp_saliency/response_tokens": 0.0,
+                "mlp_saliency/layers_observed": 0.0,
+                "mlp_saliency/updated_on_refresh": 0.0,
             }
 
         select_started = time.perf_counter()
@@ -340,12 +375,35 @@ class MLPChannelInterventionController:
         masked_per_layer = max(1, int(round(self.intermediate_size * self.mask_ratio)))
         old_masked = ~self.keep_mask
         new_keep = torch.ones_like(self.keep_mask)
+        weighted_selected_ranks: list[torch.Tensor] = []
         if self.selection_strategy == TOP_SALIENCY_SELECTION:
             for layer_idx in range(self.num_layers):
                 top_idx = torch.topk(
                     self.ema_saliency[layer_idx], k=masked_per_layer, largest=True, sorted=False
                 ).indices
                 new_keep[layer_idx, top_idx] = False
+        elif self.selection_strategy == WEIGHTED_RANDOM_SELECTION:
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(self.random_seed + self.mask_version)
+            for layer_idx in range(self.num_layers):
+                if not self.ema_initialized:
+                    selected = torch.randperm(self.intermediate_size, generator=generator)[:masked_per_layer]
+                else:
+                    order = torch.argsort(self.ema_saliency[layer_idx])
+                    rank = torch.empty(self.intermediate_size, dtype=torch.float32)
+                    rank[order] = torch.arange(self.intermediate_size, dtype=torch.float32)
+                    rank.div_(max(self.intermediate_size - 1, 1))
+                    weights = 1.0 + (self.weighted_max_ratio - 1.0) * rank.pow(
+                        self.weighted_rank_power
+                    )
+                    selected = torch.multinomial(
+                        weights,
+                        num_samples=masked_per_layer,
+                        replacement=False,
+                        generator=generator,
+                    )
+                    weighted_selected_ranks.append(rank[selected])
+                new_keep[layer_idx, selected] = False
         elif self.random_scope == PER_LAYER_RANDOM_SCOPE:
             # Every actor worker reaches refresh with the same mask version.  A CPU
             # generator therefore produces identical masks without communication,
@@ -387,6 +445,19 @@ class MLPChannelInterventionController:
                 "mlp_mask/turnover_fraction": float(1.0 - overlap / max(current, 1)),
             }
         )
+        if weighted_selected_ranks:
+            selected_ranks = torch.cat(weighted_selected_ranks)
+            metrics.update(
+                {
+                    "mlp_mask/weighted_selected_rank_mean": float(selected_ranks.mean().item()),
+                    "mlp_mask/weighted_selected_top_1pct_fraction": float(
+                        (selected_ranks >= 0.99).to(dtype=torch.float32).mean().item()
+                    ),
+                    "mlp_mask/weighted_used_saliency": 1.0,
+                }
+            )
+        elif self.selection_strategy == WEIGHTED_RANDOM_SELECTION:
+            metrics["mlp_mask/weighted_used_saliency"] = 0.0
         metrics.update(saliency_metrics)
         timings = {
             "mlp_saliency_accumulate_cpu": self._saliency_accumulate_cpu_s,
@@ -406,8 +477,14 @@ class MLPChannelInterventionController:
             "mlp_mask/version": float(self.mask_version),
             "mlp_mask/initialized": float(self.mask_version > 0),
             "mlp_mask/selection_is_random": float(self.selection_strategy == RANDOM_SELECTION),
+            "mlp_mask/selection_is_weighted_random": float(
+                self.selection_strategy == WEIGHTED_RANDOM_SELECTION
+            ),
             "mlp_mask/random_scope_is_global": float(self.random_scope == GLOBAL_RANDOM_SCOPE),
             "mlp_mask/random_seed": float(self.random_seed),
+            "mlp_mask/weighted_max_ratio": float(self.weighted_max_ratio),
+            "mlp_mask/weighted_rank_power": float(self.weighted_rank_power),
+            "mlp_saliency/ema_beta": float(self.ema_beta),
             "mlp_mask/layers": float(self.num_layers),
             "mlp_mask/channels_per_layer": float(self.intermediate_size),
             "mlp_mask/masked_per_layer": float(current / self.num_layers),
@@ -432,6 +509,8 @@ class MLPChannelInterventionController:
             "selection_strategy": self.selection_strategy,
             "random_seed": self.random_seed,
             "random_scope": self.random_scope,
+            "weighted_max_ratio": self.weighted_max_ratio,
+            "weighted_rank_power": self.weighted_rank_power,
             "keep_mask": self.keep_mask.cpu(),
             "ever_masked": self.ever_masked.cpu(),
             "ema_saliency": self.ema_saliency.cpu(),
@@ -458,6 +537,22 @@ class MLPChannelInterventionController:
             raise ValueError(
                 f"checkpoint random_scope={checkpoint_random_scope!r} does not match "
                 f"controller random_scope={self.random_scope!r}"
+            )
+        checkpoint_weighted_max_ratio = float(
+            state.get("weighted_max_ratio", self.weighted_max_ratio)
+        )
+        if checkpoint_weighted_max_ratio != self.weighted_max_ratio:
+            raise ValueError(
+                f"checkpoint weighted_max_ratio={checkpoint_weighted_max_ratio} does not match "
+                f"controller weighted_max_ratio={self.weighted_max_ratio}"
+            )
+        checkpoint_weighted_rank_power = float(
+            state.get("weighted_rank_power", self.weighted_rank_power)
+        )
+        if checkpoint_weighted_rank_power != self.weighted_rank_power:
+            raise ValueError(
+                f"checkpoint weighted_rank_power={checkpoint_weighted_rank_power} does not match "
+                f"controller weighted_rank_power={self.weighted_rank_power}"
             )
         expected = (self.num_layers, self.intermediate_size)
         keep_mask = torch.as_tensor(state["keep_mask"], dtype=torch.bool)

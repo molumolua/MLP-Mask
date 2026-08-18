@@ -19,6 +19,7 @@ from .intervention import (
     MASKED_ROUTE,
     MLPChannelInterventionController,
     RANDOM_SELECTION,
+    WEIGHTED_RANDOM_SELECTION,
     install_hf_mlp_intervention,
     install_vllm_class_intervention,
     install_vllm_mlp_intervention,
@@ -124,6 +125,20 @@ class MLPChannelInterventionTest(unittest.TestCase):
         self.assertTrue(torch.equal(masked[0, :8], torch.ones(8)))
         self.assertTrue(torch.equal(masked[0, 8:], torch.zeros(2)))
 
+    def test_zero_ema_beta_replaces_saliency_with_current_collection(self) -> None:
+        controller = self._controller()
+        first = torch.arange(1, 11, dtype=torch.float32)
+        second = torch.flip(first, dims=(0,))
+
+        self._collect(controller, first)
+        controller.refresh_mask()
+        self.assertTrue(torch.equal(controller.ema_saliency[0], first))
+
+        self._collect(controller, second)
+        result = controller.refresh_mask()
+        self.assertTrue(torch.equal(controller.ema_saliency[0], second))
+        self.assertEqual(result.metrics["mlp_saliency/ema_beta"], 0.0)
+
     def test_default_ten_percent_masks_each_block(self) -> None:
         controller = MLPChannelInterventionController(
             num_layers=3,
@@ -201,6 +216,57 @@ class MLPChannelInterventionTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "random_scope"):
             per_layer.load_state_dict(first.state_dict())
+
+    def test_weighted_random_is_exact_reproducible_and_saliency_biased(self) -> None:
+        def weighted_controller():
+            return MLPChannelInterventionController(
+                num_layers=2,
+                intermediate_size=20,
+                mask_ratio=0.10,
+                ema_beta=0.0,
+                selection_strategy=WEIGHTED_RANDOM_SELECTION,
+                random_seed=7,
+                weighted_max_ratio=4.0,
+                weighted_rank_power=2.0,
+            )
+
+        first = weighted_controller()
+        second = weighted_controller()
+        first_uniform = first.refresh_mask()
+        second.refresh_mask()
+        self.assertEqual((~first.keep_mask).sum(dim=-1).tolist(), [2, 2])
+        self.assertTrue(torch.equal(first.keep_mask, second.keep_mask))
+        self.assertEqual(first_uniform.metrics["mlp_mask/weighted_used_saliency"], 0.0)
+
+        saliency = torch.arange(1, 21, dtype=torch.float32)
+        self._collect(first, saliency)
+        self._collect(second, saliency)
+        weighted_result = first.refresh_mask()
+        second.refresh_mask()
+        self.assertTrue(torch.equal(first.keep_mask, second.keep_mask))
+        self.assertEqual(weighted_result.metrics["mlp_mask/weighted_used_saliency"], 1.0)
+        self.assertEqual(weighted_result.metrics["mlp_mask/weighted_max_ratio"], 4.0)
+        self.assertEqual(weighted_result.metrics["mlp_mask/weighted_rank_power"], 2.0)
+
+        selected_counts = torch.zeros(20, dtype=torch.int64)
+        for _ in range(200):
+            first.refresh_mask()
+            self.assertEqual((~first.keep_mask).sum(dim=-1).tolist(), [2, 2])
+            selected_counts.add_((~first.keep_mask).sum(dim=0))
+        self.assertGreater(int(selected_counts[10:].sum()), int(selected_counts[:10].sum()))
+
+        restored = weighted_controller()
+        restored.load_state_dict(first.state_dict())
+        self.assertTrue(torch.equal(restored.keep_mask, first.keep_mask))
+        self.assertTrue(torch.equal(restored.ema_saliency, first.ema_saliency))
+
+        with self.assertRaisesRegex(ValueError, "random_scope=global"):
+            MLPChannelInterventionController(
+                num_layers=2,
+                intermediate_size=20,
+                selection_strategy=WEIGHTED_RANDOM_SELECTION,
+                random_scope=GLOBAL_RANDOM_SCOPE,
+            )
 
     def test_unique_history_and_checkpoint_round_trip(self) -> None:
         controller = self._controller()

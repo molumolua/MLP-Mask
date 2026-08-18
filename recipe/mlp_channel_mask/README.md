@@ -38,7 +38,7 @@ masked 路径只在 `down_proj` 之前插入逐 channel mask：
 5. 将两次输出恢复到原始交错顺序，分别保留 route、mask version 和 vLLM behavior log-prob。
 6. clean 与 masked 使用不同的 GRPO `uid`，各自在本 route 的 8 个样本内计算均值和标准差。
 7. actor update 先按 route 拆成同质 micro-batches，再在同一个 optimizer step 中累计两条路径的梯度。
-8. 如果当前 step 是 mask-refresh step，clean backward 同时收集一次贡献度；其余 step 不注册 saliency hook。
+8. clean backward 可在 mask-refresh step 或显式配置为每个 step 时收集贡献度。
 9. 到达 `test_freq` 时，先做无 mask 的 clean validation，再选择下一版 mask。
 
 初始 `mask_version=0` 时 mask 全为 1，因此第一个 train step 的两个 route 在函数上相同，只是独立采样。这个 step 用来建立第一版贡献度；step 结束后生成 `mask_version=1`。
@@ -95,7 +95,8 @@ c_{l,j}=\frac{1}{N}
 \beta\bar c_l^{(v-1)}+(1-\beta)c_l^{(v)},
 \]
 
-默认 `beta=0.95`；第一次刷新直接使用当前统计。对每一层独立计算
+默认配置为 `beta=0.95`；第一次刷新直接使用当前统计。设置 `beta=0` 时，
+每次更新都会完全替换旧值，只使用本次收集 step 的统计。对每一层独立计算
 
 \[
 k=\max\left(1,\operatorname{round}(0.1d_{ff})\right),
@@ -120,12 +121,30 @@ random 采样范围由 `random_scope` 控制：
 两者的全模型期望比例相同；模型每层宽度一致时，`per_layer` 的总量也与 global
 基本相同，但它消除了层间采样方差。
 
+`selection_strategy=weighted_random` 在逐层 random 的基础上按 clean saliency
+百分位增加采样权重。对每层 channel 的升序百分位 rank `r in [0, 1]` 使用固定公式：
+
+```text
+weight = 1 + (weighted_max_ratio - 1) * r ** weighted_rank_power
+```
+
+默认 `weighted_max_ratio=4`、`weighted_rank_power=2`，最高 saliency channel 的
+权重最多是最低 channel 的 4 倍。采样始终无放回且每层精确屏蔽 10%。该模式
+没有权重 warmup 或渐进增强：取得第一版 saliency 后立即使用完整固定权重。
+step 1 先使用 uniform random mask 并收集 saliency，从 step 2 开始 weighted random。
+配套 weighted-random bash 设置 `saliency_update_every_step=true` 和
+`saliency_ema_beta=0`：step t 的 clean backward 只计算当前 step saliency，step
+结束后立即据此采样 step t+1 的 mask。权重仍是上述固定公式，不做渐进增强。
+
 设置 `random_resample_every_step=true` 后使用另一种时序：每个 train step 的
 rollout 之前先生成一版新随机 mask，所以 step 1 就使用 `mask_version=1`，没有
 全 1 warmup。同一个 step 内 mask 保持不变，只在下一个 step 开始前再次采样。
 这个频率独立于 validation/checkpoint 的 `test_freq`。
 
-top-saliency 模式只在 `warmup_steps=1` 和之后每个 `test_freq` 对应的单个 train step 上收集贡献度。random 模式完全不挂 activation-gradient hook，也不执行 saliency all-reduce。
+默认 top-saliency 模式只在 `warmup_steps=1` 和之后每个 `test_freq` 对应的
+单个 train step 上收集贡献度。设置 `saliency_update_every_step=true` 后，
+top-saliency 或 weighted-random 会在每个 train step 收集并更新。uniform random
+模式完全不挂 activation-gradient hook，也不执行 saliency all-reduce。
 
 ## 为什么 validation 使用 clean route
 
@@ -148,7 +167,9 @@ top-saliency 模式只在 `warmup_steps=1` 和之后每个 `test_freq` 对应的
 - vLLM 类在 engine 构建和 CUDA graph capture 之前完成 patch。每层 mask tensor 的地址固定，route 切换只做 in-place copy，不会每 token 在线重建 hook 或 mask。
 - mask 乘法复杂度为 `O(L*T*d_ff)`，相对 MLP 矩阵乘法通常很小，但它不会减少 GEMM FLOPs，所以这不是推理加速方案。
 - actor 仍处理总共 16 条 trajectory。route 分开 packing 会增加少量调度开销，但总 token 数不变。
-- saliency 的额外 `abs(z*grad)` 和 channel reduction 只发生在刷新 step。它会增加该 step 的显存带宽和临时张量压力，因此提供了独立 timing。
+- saliency 的额外 `abs(z*grad)` 和 channel reduction 默认只发生在刷新 step；
+  every-step 模式下则每步发生。它会增加显存带宽和临时张量压力，因此提供了
+  独立 timing。
 
 如果把配置改成 16 clean + 16 masked，总 rollout 和 actor token 预算才会接近基线的两倍。
 
@@ -170,6 +191,11 @@ mask 指标：
 - `mlp_mask/rollout_version_used`：本 step rollout 实际使用的版本
 - `mlp_mask/random_resample_every_step`：是否在每个 step 的 rollout 前随机重采样
 - `mlp_mask/random_scope_is_global`：1 表示全局随机配额，0 表示逐层配额
+- `mlp_mask/selection_is_weighted_random`
+- `mlp_mask/weighted_max_ratio` / `weighted_rank_power`
+- `mlp_mask/weighted_selected_rank_mean`
+- `mlp_mask/weighted_selected_top_1pct_fraction`
+- `mlp_mask/weighted_used_saliency`
 - `mlp_mask/current_channels` / `current_fraction`
 - `mlp_mask/masked_per_layer_min` / `max`：用于确认 block 内配额严格平衡
 - `mlp_mask/ever_unique_channels` / `ever_unique_fraction`
@@ -179,6 +205,7 @@ mask 指标：
 - `mlp_mask/cumulative_assignments`
 - `mlp_saliency/mean|max|min|response_tokens|layers_observed`
 - `mlp_saliency/collection_enabled`
+- `mlp_saliency/update_every_step`, `mlp_saliency/ema_beta`
 
 所有新增阶段都有秒级 timing，包括：
 
@@ -189,7 +216,9 @@ mask 指标：
 - `timing_s/mlp_prefix_cache_reset_before_clean|between_routes|after_masked`
 - rollout/actor route switch
 - clean/masked actor forward-backward
-- saliency accumulate、all-reduce、top-k selection、总 refresh 和 actor→rollout mask sync
+- `timing_s/mlp_saliency_accumulate_cpu`（hook 的 CPU dispatch，不含异步 GPU 完成时间）
+- `timing_s/mlp_saliency_enabled_actor_update`（开启 saliency 的完整 actor-update wall time）
+- saliency all-reduce、mask selection、总 refresh 和 actor→rollout mask sync
 - `timing_s/testing_clean`
 
 GRPO 不使用 critic，因此不存在可正确解释的 `clean_critic/masked_critic`。本 recipe 明确拒绝启用 critic，而不是记录两个虚假的 critic 指标。
@@ -213,7 +242,7 @@ cd /Users/molu/verl-mlp_channels_mask
 bash recipe/mlp_channel_mask/grpo_mlp_channel_mask_qwen3-4b_offline.sh
 ```
 
-随机屏蔽每层 10% channels 的对照实验：
+按原 refresh 周期随机屏蔽每层 1% channels 的对照实验（脚本名为历史保留）：
 
 ```bash
 bash recipe/mlp_channel_mask/grpo_mlp_channel_mask_qwen3-4b_random10_offline.sh
@@ -229,6 +258,12 @@ bash recipe/mlp_channel_mask/grpo_mlp_channel_mask_qwen3-4b_random10_every_step_
 
 ```bash
 bash recipe/mlp_channel_mask/grpo_mlp_channel_mask_qwen3-4b_global_random10_every_step_offline.sh
+```
+
+每个训练 step 在每层按固定 saliency 权重随机屏蔽 10% channels：
+
+```bash
+bash recipe/mlp_channel_mask/grpo_mlp_channel_mask_qwen3-4b_weighted_random10_every_step_offline.sh
 ```
 
 若希望全局随机但只按原 refresh 周期换 mask，可运行：

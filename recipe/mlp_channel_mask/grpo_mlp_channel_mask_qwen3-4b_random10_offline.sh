@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Random-channel ablation baseline: every refresh independently samples exactly
-# 10% of the intermediate channels in every Transformer MLP block.  The seed and
+# 1% of the intermediate channels in every Transformer MLP block.  The seed and
 # mask version make the sampling reproducible while still changing across refreshes.
 model_name=${model_name:-Qwen3-4B-Base}
 export model_name

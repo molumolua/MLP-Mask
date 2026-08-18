@@ -36,6 +36,7 @@ from .intervention import (
     PER_LAYER_RANDOM_SCOPE,
     RANDOM_SELECTION,
     TOP_SALIENCY_SELECTION,
+    WEIGHTED_RANDOM_SELECTION,
 )
 
 
@@ -84,7 +85,11 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
         if refresh_freq != int(config.trainer.test_freq):
             raise ValueError("mlp_intervention.refresh_freq must equal trainer.test_freq in this recipe")
         selection_strategy = str(intervention.get("selection_strategy", TOP_SALIENCY_SELECTION))
-        if selection_strategy not in {TOP_SALIENCY_SELECTION, RANDOM_SELECTION}:
+        if selection_strategy not in {
+            TOP_SALIENCY_SELECTION,
+            RANDOM_SELECTION,
+            WEIGHTED_RANDOM_SELECTION,
+        }:
             raise ValueError(f"unsupported mlp_intervention.selection_strategy={selection_strategy!r}")
         random_scope = str(intervention.get("random_scope", PER_LAYER_RANDOM_SCOPE))
         if random_scope not in {PER_LAYER_RANDOM_SCOPE, GLOBAL_RANDOM_SCOPE}:
@@ -92,9 +97,22 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
         if random_scope == GLOBAL_RANDOM_SCOPE and selection_strategy != RANDOM_SELECTION:
             raise ValueError("mlp_intervention.random_scope=global requires selection_strategy=random")
         random_resample_every_step = bool(intervention.get("random_resample_every_step", False))
-        if random_resample_every_step and selection_strategy != RANDOM_SELECTION:
+        if random_resample_every_step and selection_strategy not in {
+            RANDOM_SELECTION,
+            WEIGHTED_RANDOM_SELECTION,
+        }:
             raise ValueError(
-                "mlp_intervention.random_resample_every_step=true requires selection_strategy=random"
+                "mlp_intervention.random_resample_every_step=true requires "
+                "selection_strategy=random or weighted_random"
+            )
+        saliency_update_every_step = bool(intervention.get("saliency_update_every_step", False))
+        if saliency_update_every_step and selection_strategy not in {
+            TOP_SALIENCY_SELECTION,
+            WEIGHTED_RANDOM_SELECTION,
+        }:
+            raise ValueError(
+                "mlp_intervention.saliency_update_every_step=true requires "
+                "selection_strategy=top_saliency or weighted_random"
             )
 
     def _build_dual_route_batch(self, batch: DataProto, mask_version: int) -> DataProto:
@@ -238,12 +256,22 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
         warmup_steps = int(intervention.get("warmup_steps", 1))
         selection_strategy = str(intervention.get("selection_strategy", TOP_SALIENCY_SELECTION))
         random_resample_every_step = bool(intervention.get("random_resample_every_step", False))
+        saliency_update_every_step = bool(intervention.get("saliency_update_every_step", False))
+        weighted_random = selection_strategy == WEIGHTED_RANDOM_SELECTION
+        # A weighted refresh performed after a checkpointed step prepares the mask
+        # for the next step.  On resume, version==next global step preserves it.
+        mask_prepared_for_current_step = (
+            weighted_random
+            and random_resample_every_step
+            and mask_version == self.global_steps
+        )
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics: dict[str, float] = {}
                 timing_raw: dict[str, float] = {}
                 metrics["mlp_mask/random_resample_every_step"] = float(random_resample_every_step)
+                metrics["mlp_saliency/update_every_step"] = float(saliency_update_every_step)
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
                         not prev_step_profile and curr_step_profile
@@ -252,16 +280,19 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
                     )
 
                 if random_resample_every_step:
-                    # Random masks need no backward statistics.  Resample before
-                    # building the batch so step 1 is masked too, then keep this
-                    # version fixed for rollout, old-logprob, and actor update.
-                    with marked_timer("mlp_mask_resample_driver", timing_raw, color="cyan"):
-                        mask_version = self._refresh_mask(metrics, timing_raw)
-                    current_mask_metrics = {
-                        key: value
-                        for key, value in metrics.items()
-                        if key.startswith("mlp_mask/") and key != "mlp_mask/rollout_version_used"
-                    }
+                    if mask_prepared_for_current_step:
+                        mask_prepared_for_current_step = False
+                    else:
+                        # Sample before rollout and keep this version fixed for
+                        # rollout, old-logprob, and the complete actor update.
+                        with marked_timer("mlp_mask_resample_driver", timing_raw, color="cyan"):
+                            mask_version = self._refresh_mask(metrics, timing_raw)
+                        current_mask_metrics = {
+                            key: value
+                            for key, value in metrics.items()
+                            if key.startswith("mlp_mask/")
+                            and key != "mlp_mask/rollout_version_used"
+                        }
 
                 with marked_timer("dual_batch_build", timing_raw):
                     base_batch = DataProto.from_single_dict(batch_dict)
@@ -269,14 +300,18 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
                         [str(uuid.uuid4()) for _ in range(len(base_batch.batch))], dtype=object
                     )
                     batch = self._build_dual_route_batch(base_batch, mask_version=mask_version)
-                should_refresh = not random_resample_every_step and (
-                    self.global_steps == warmup_steps
-                    or (refresh_freq > 0 and self.global_steps % refresh_freq == 0)
+                saliency_refresh_due = self.global_steps == warmup_steps or (
+                    refresh_freq > 0 and self.global_steps % refresh_freq == 0
                 )
-                # Contribution statistics are intentionally sampled from exactly
-                # one forced-on-policy train step at each refresh boundary.  This
-                # avoids activation-gradient hooks on all intervening steps.
-                collect_mlp_saliency = should_refresh and selection_strategy == TOP_SALIENCY_SELECTION
+                saliency_update_due = saliency_update_every_step or saliency_refresh_due
+                should_refresh = not random_resample_every_step and saliency_update_due
+                collect_mlp_saliency = saliency_update_due and selection_strategy in {
+                    TOP_SALIENCY_SELECTION,
+                    WEIGHTED_RANDOM_SELECTION,
+                }
+                # With every-step updates, step t's clean backward prepares the
+                # saliency-dependent mask for step t+1.  Otherwise hooks are only
+                # installed on the periodic refresh step.
                 batch.meta_info["collect_mlp_saliency"] = collect_mlp_saliency
                 metrics["mlp_mask/rollout_version_used"] = float(mask_version)
                 gen_batch = self._get_gen_batch(batch)
@@ -363,6 +398,13 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
                             )
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
+                        if collect_mlp_saliency:
+                            # This RPC wall time includes the GPU hook work.  The
+                            # controller's accumulate timing only measures host
+                            # dispatch because CUDA kernels are asynchronous.
+                            timing_raw["mlp_saliency_enabled_actor_update"] = timing_raw[
+                                "update_actor_dual"
+                            ]
 
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
@@ -391,6 +433,18 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
                             for key, value in metrics.items()
                             if key.startswith("mlp_mask/") and key != "mlp_mask/rollout_version_used"
                         }
+                elif weighted_random and random_resample_every_step and collect_mlp_saliency:
+                    # Consume the newly collected saliency before checkpointing and
+                    # prepare the weighted mask for the next step.  The next loop
+                    # must reuse it instead of sampling twice.
+                    with marked_timer("mlp_mask_refresh_driver", timing_raw, color="cyan"):
+                        mask_version = self._refresh_mask(metrics, timing_raw)
+                    current_mask_metrics = {
+                        key: value
+                        for key, value in metrics.items()
+                        if key.startswith("mlp_mask/") and key != "mlp_mask/rollout_version_used"
+                    }
+                    mask_prepared_for_current_step = True
                 else:
                     metrics.update(current_mask_metrics)
 

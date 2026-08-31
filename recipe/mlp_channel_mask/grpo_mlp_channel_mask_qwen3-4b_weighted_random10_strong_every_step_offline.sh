@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Stronger per-layer weighted-random intervention at the same 1% mask budget.
+# Stronger per-layer weighted-random intervention at the same 10% mask budget.
 # With rank r in [0, 1], these defaults implement
 #
 #   weight(r) = 1 + 10 * r^2

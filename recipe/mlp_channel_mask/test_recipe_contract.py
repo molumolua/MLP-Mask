@@ -148,11 +148,11 @@ class RecipeContractTest(unittest.TestCase):
     def test_strong_weighted_random_launcher_uses_one_plus_ten_r_squared(self) -> None:
         launcher = (
             RECIPE_DIR
-            / "grpo_mlp_channel_mask_qwen3-4b_weighted_random1_strong_every_step_offline.sh"
+            / "grpo_mlp_channel_mask_qwen3-4b_weighted_random10_strong_every_step_offline.sh"
         ).read_text()
 
         self.assertIn("selection_strategy=${selection_strategy:-weighted_random}", launcher)
-        self.assertIn("mask_ratio=${mask_ratio:-0.01}", launcher)
+        self.assertIn("mask_ratio=${mask_ratio:-0.10}", launcher)
         self.assertIn("random_scope=${random_scope:-per_layer}", launcher)
         self.assertIn("weighted_max_ratio=${weighted_max_ratio:-11.0}", launcher)
         self.assertIn("weighted_rank_power=${weighted_rank_power:-2.0}", launcher)

@@ -12,7 +12,7 @@ set -euo pipefail
 model_name=${model_name:-Qwen3-4B-Base}
 export model_name
 export selection_strategy=${selection_strategy:-weighted_random}
-export mask_ratio=${mask_ratio:-0.01}
+export mask_ratio=${mask_ratio:-0.10}
 export random_seed=${random_seed:-42}
 export random_scope=${random_scope:-per_layer}
 export weighted_max_ratio=${weighted_max_ratio:-11.0}

@@ -53,6 +53,13 @@ class RecipeContractTest(unittest.TestCase):
         launcher = (RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_offline.sh").read_text()
         self.assertIn("algorithm.rollout_correction.bypass_old_logprob_for_rollout=False", launcher)
 
+    def test_standard_trainer_passes_rollout_correction_config(self) -> None:
+        trainer_source = (WORKSPACE / "verl" / "trainer" / "ppo" / "ray_trainer.py").read_text()
+        self.assertIn(
+            "batch, rollout_corr_config=rollout_corr_config",
+            trainer_source,
+        )
+
     def test_grpo_baseline_reuses_common_config_with_equal_rollout_budget(self) -> None:
         baseline = (RECIPE_DIR / "baseline_grpo_qwen3-4b_offline.sh").read_text()
         launcher = (RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_offline.sh").read_text()

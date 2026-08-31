@@ -51,6 +51,7 @@ from verl.trainer.ppo.metric_utils import (
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
+from verl.trainer.ppo.validation_utils import compute_pass_at_k_metrics, validation_prompt_uid
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
@@ -529,6 +530,9 @@ class RayPPOTrainer:
     def _validate(self):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+        merge_duplicate_prompts = bool(
+            self.config.trainer.get("merge_duplicate_val_prompts", False)
+        )
 
         # Lists to collect samples for the table
         sample_inputs = []
@@ -560,7 +564,10 @@ class RayPPOTrainer:
             # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
-            sample_uids.extend(test_batch.non_tensor_batch["uid"])
+            if merge_duplicate_prompts:
+                sample_uids.extend(validation_prompt_uid(text) for text in input_texts)
+            else:
+                sample_uids.extend(test_batch.non_tensor_batch["uid"])
 
             ground_truths = [
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
@@ -658,6 +665,32 @@ class RayPPOTrainer:
                         metric_sec = "val-aux"
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
+
+        if merge_duplicate_prompts:
+            acc_values = reward_extra_infos_dict.get("acc", [])
+            if len(acc_values) == len(sample_scores):
+                correctness_values = acc_values
+                correctness_var = "acc"
+                correctness_threshold = 0.0
+            else:
+                correctness_values = sample_scores
+                correctness_var = "reward"
+                correctness_threshold = float(
+                    self.config.trainer.get("validation_pass_reward_threshold", 0.0)
+                )
+            pass_at_k = compute_pass_at_k_metrics(
+                data_sources=data_sources,
+                prompt_uids=sample_uids,
+                correctness_values=correctness_values,
+                threshold=correctness_threshold,
+            )
+            for data_source, source_metrics in pass_at_k.items():
+                for metric_name, metric_val in source_metrics.items():
+                    if metric_name.startswith("pass@"):
+                        key = f"val-core/{data_source}/{correctness_var}/{metric_name}"
+                    else:
+                        key = f"val-aux/{data_source}/duplicate_prompts/{metric_name}"
+                    metric_dict[key] = metric_val
 
         if len(sample_turns) > 0:
             sample_turns = np.concatenate(sample_turns)

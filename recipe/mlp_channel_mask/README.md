@@ -178,6 +178,8 @@ top-saliency 或 weighted-random 会在每个 train step 收集并更新。unifo
 route 指标：
 
 - `clean_actor/reward_mean`, `masked_actor/reward_mean`
+- `clean_actor/entropy`, `masked_actor/entropy`
+- `route/entropy_gap_masked_minus_clean`
 - `clean_actor/advantage_mean`, `masked_actor/advantage_mean`
 - `clean_actor/pg_loss`, `masked_actor/pg_loss`
 - `clean_actor/pg_clipfrac`, `masked_actor/pg_clipfrac`
@@ -221,6 +223,11 @@ mask 指标：
 - saliency all-reduce、mask selection、总 refresh 和 actor→rollout mask sync
 - `timing_s/testing_clean`
 
+validation 会在每个 `data_source` 内按规范化后的完整题面合并重复行，而不是按可能
+不同的行号或 `uid` 区分。若同一道题有 16 条生成结果，会额外记录标准无偏估计的
+`pass@1`、`pass@2`、`pass@4`、`pass@8` 和 `pass@16`；同时记录 unique prompt 数及
+每题采样数的 min/max，便于确认 AIME 的 30 题 × 16 次是否被正确恢复。
+
 GRPO 不使用 critic，因此不存在可正确解释的 `clean_critic/masked_critic`。本 recipe 明确拒绝启用 critic，而不是记录两个虚假的 critic 指标。
 
 ## Checkpoint
@@ -258,6 +265,13 @@ bash recipe/mlp_channel_mask/grpo_mlp_channel_mask_qwen3-4b_random10_every_step_
 
 ```bash
 bash recipe/mlp_channel_mask/grpo_mlp_channel_mask_qwen3-4b_global_random10_every_step_offline.sh
+```
+
+每个训练 step 逐层 weighted-random 屏蔽 1%，并使用更强的
+`weight(r) = 1 + 10 r^2`：
+
+```bash
+bash recipe/mlp_channel_mask/grpo_mlp_channel_mask_qwen3-4b_weighted_random1_strong_every_step_offline.sh
 ```
 
 每个训练 step 在每层按固定 saliency 权重随机屏蔽 10% channels：

@@ -143,6 +143,8 @@ python3 -m recipe.mlp_channel_mask.main \
     trainer.logger="['console','wandb']" \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
+    trainer.merge_duplicate_val_prompts=True \
+    trainer.validation_pass_reward_threshold=0.0 \
     trainer.n_gpus_per_node=${num_gpus} \
     trainer.nnodes=1 \
     trainer.balance_batch=True \

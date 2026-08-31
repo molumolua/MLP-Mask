@@ -49,3 +49,7 @@ reward_model:
 
 trainer:
   project_name: MLP-Channel-Intervention
+  # Treat repeated validation rows with the same normalized prompt as repeated
+  # samples of one question, enabling exact pass@1/2/4/... aggregation.
+  merge_duplicate_val_prompts: true
+  validation_pass_reward_threshold: 0.0

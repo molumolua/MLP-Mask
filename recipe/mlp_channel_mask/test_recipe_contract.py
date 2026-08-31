@@ -134,6 +134,37 @@ class RecipeContractTest(unittest.TestCase):
         )
         self.assertIn('timing_raw["mlp_saliency_enabled_actor_update"]', trainer_source)
 
+    def test_strong_weighted_random_launcher_uses_one_plus_ten_r_squared(self) -> None:
+        launcher = (
+            RECIPE_DIR
+            / "grpo_mlp_channel_mask_qwen3-4b_weighted_random1_strong_every_step_offline.sh"
+        ).read_text()
+
+        self.assertIn("selection_strategy=${selection_strategy:-weighted_random}", launcher)
+        self.assertIn("mask_ratio=${mask_ratio:-0.01}", launcher)
+        self.assertIn("random_scope=${random_scope:-per_layer}", launcher)
+        self.assertIn("weighted_max_ratio=${weighted_max_ratio:-11.0}", launcher)
+        self.assertIn("weighted_rank_power=${weighted_rank_power:-2.0}", launcher)
+        self.assertIn("random_resample_every_step=${random_resample_every_step:-True}", launcher)
+        self.assertIn("saliency_update_every_step=${saliency_update_every_step:-True}", launcher)
+
+    def test_validation_merges_duplicate_prompts_and_logs_pass_at_k(self) -> None:
+        config = yaml.safe_load((RECIPE_DIR / "config" / "ppo_mlp_channel_mask.yaml").read_text())
+        launcher = (RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_offline.sh").read_text()
+        ray_trainer_source = (WORKSPACE / "verl" / "trainer" / "ppo" / "ray_trainer.py").read_text()
+
+        self.assertTrue(config["trainer"]["merge_duplicate_val_prompts"])
+        self.assertIn("trainer.merge_duplicate_val_prompts=True", launcher)
+        self.assertIn("validation_prompt_uid(text)", ray_trainer_source)
+        self.assertIn("compute_pass_at_k_metrics(", ray_trainer_source)
+
+    def test_training_entropy_is_split_by_route(self) -> None:
+        trainer_source = (RECIPE_DIR / "trainer.py").read_text()
+
+        self.assertIn('metrics["actor/entropy"]', trainer_source)
+        self.assertIn('metrics[f"{route}_actor/entropy"]', trainer_source)
+        self.assertIn('metrics["route/entropy_gap_masked_minus_clean"]', trainer_source)
+
     def test_recipe_does_not_import_another_recipe(self) -> None:
         for source_path in RECIPE_DIR.glob("*.py"):
             if source_path.name.startswith("test_"):

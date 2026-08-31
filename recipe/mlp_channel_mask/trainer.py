@@ -360,6 +360,14 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
                                 loss_agg_mode=self.config.actor_rollout_ref.actor.loss_agg_mode,
                             )
                             metrics["actor/entropy"] = entropy_agg.detach().item()
+                            metrics.update(
+                                compute_route_entropy_metrics(
+                                    entropys=entropys,
+                                    response_mask=batch.batch["response_mask"],
+                                    route_values=batch.non_tensor_batch["route_id"],
+                                    loss_agg_mode=self.config.actor_rollout_ref.actor.loss_agg_mode,
+                                )
+                            )
                             old_log_prob.batch.pop("entropys")
                             batch = batch.union(old_log_prob)
                     if "old_log_probs" not in batch.batch:
@@ -508,6 +516,33 @@ def _round_robin_indices(clean_size: int, masked_size: int) -> list[int]:
         if offset < masked_size:
             indices.append(clean_size + offset)
     return indices
+
+
+def compute_route_entropy_metrics(
+    entropys: torch.Tensor,
+    response_mask: torch.Tensor,
+    route_values: np.ndarray,
+    loss_agg_mode: str,
+) -> dict[str, float]:
+    """Aggregate entropy independently for clean and masked policy routes."""
+    route_values = np.asarray(route_values, dtype=object)
+    metrics: dict[str, float] = {}
+    for route in (CLEAN_ROUTE, MASKED_ROUTE):
+        idx_np = np.flatnonzero(route_values == route)
+        if idx_np.size == 0:
+            continue
+        idx = torch.as_tensor(idx_np, device=entropys.device, dtype=torch.long)
+        route_entropy = agg_loss(
+            loss_mat=entropys.index_select(0, idx),
+            loss_mask=response_mask.to(device=entropys.device).index_select(0, idx),
+            loss_agg_mode=loss_agg_mode,
+        )
+        metrics[f"{route}_actor/entropy"] = float(route_entropy.detach().item())
+    if "clean_actor/entropy" in metrics and "masked_actor/entropy" in metrics:
+        metrics["route/entropy_gap_masked_minus_clean"] = (
+            metrics["masked_actor/entropy"] - metrics["clean_actor/entropy"]
+        )
+    return metrics
 
 
 def compute_route_metrics(batch: DataProto) -> dict[str, float]:

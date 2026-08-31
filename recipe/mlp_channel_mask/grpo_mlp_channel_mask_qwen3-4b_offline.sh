@@ -15,11 +15,12 @@ tensor_model_parallel_size=${tensor_model_parallel_size:-1}
 sp_size=${sp_size:-1}
 offload=${offload:-True}
 ref_offload=${ref_offload:-True}
+mlp_intervention_enabled=${mlp_intervention_enabled:-True}
 
 # Budget-matched dual rollout: 8 clean + 8 masked = the original 16 samples.
 n_clean=${n_clean:-8}
 n_masked=${n_masked:-8}
-n_total=$((n_clean + n_masked))
+n_total=${n_total:-$((n_clean + n_masked))}
 mask_ratio=${mask_ratio:-0.01}
 selection_strategy=${selection_strategy:-top_saliency}
 random_seed=${random_seed:-42}
@@ -62,7 +63,38 @@ top_k=${top_k:--1}
 val_temperature=${val_temperature:-0.6}
 val_top_p=${val_top_p:-0.95}
 
-python3 -m recipe.mlp_channel_mask.main \
+case "${mlp_intervention_enabled}" in
+    True|true)
+        trainer_module=recipe.mlp_channel_mask.main
+        mlp_intervention_args=(
+            actor_rollout_ref.mlp_intervention.enabled=True
+            actor_rollout_ref.mlp_intervention.n_clean=${n_clean}
+            actor_rollout_ref.mlp_intervention.n_masked=${n_masked}
+            actor_rollout_ref.mlp_intervention.mask_ratio=${mask_ratio}
+            actor_rollout_ref.mlp_intervention.selection_strategy=${selection_strategy}
+            actor_rollout_ref.mlp_intervention.random_seed=${random_seed}
+            actor_rollout_ref.mlp_intervention.random_scope=${random_scope}
+            actor_rollout_ref.mlp_intervention.weighted_max_ratio=${weighted_max_ratio}
+            actor_rollout_ref.mlp_intervention.weighted_rank_power=${weighted_rank_power}
+            actor_rollout_ref.mlp_intervention.random_resample_every_step=${random_resample_every_step}
+            actor_rollout_ref.mlp_intervention.saliency_update_every_step=${saliency_update_every_step}
+            actor_rollout_ref.mlp_intervention.saliency_ema_beta=${saliency_ema_beta}
+            actor_rollout_ref.mlp_intervention.warmup_steps=1
+            actor_rollout_ref.mlp_intervention.refresh_freq=${test_and_save_freq}
+        )
+        ;;
+    False|false)
+        trainer_module=verl.trainer.main_ppo
+        mlp_intervention_args=()
+        ;;
+    *)
+        echo "mlp_intervention_enabled must be True or False, got: ${mlp_intervention_enabled}" >&2
+        exit 2
+        ;;
+esac
+
+python_bin=${python_bin:-python3}
+"${python_bin}" -m "${trainer_module}" \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
     data.prompt_key=prompt \
@@ -104,8 +136,8 @@ python3 -m recipe.mlp_channel_mask.main \
     actor_rollout_ref.actor.optim.lr=${lr} \
     actor_rollout_ref.actor.optim.lr_warmup_steps=${lr_warmup_steps} \
     actor_rollout_ref.actor.optim.weight_decay=0 \
-    actor_rollout_ref.actor.force_on_policy=True \
-    actor_rollout_ref.actor.use_rollout_log_probs=True \
+    ++actor_rollout_ref.actor.force_on_policy=True \
+    ++actor_rollout_ref.actor.use_rollout_log_probs=True \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.loss_agg_mode=token-mean \
@@ -119,32 +151,19 @@ python3 -m recipe.mlp_channel_mask.main \
     actor_rollout_ref.ref.fsdp_config.param_offload=${ref_offload} \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
-    actor_rollout_ref.mlp_intervention.enabled=True \
-    actor_rollout_ref.mlp_intervention.n_clean=${n_clean} \
-    actor_rollout_ref.mlp_intervention.n_masked=${n_masked} \
-    actor_rollout_ref.mlp_intervention.mask_ratio=${mask_ratio} \
-    actor_rollout_ref.mlp_intervention.selection_strategy=${selection_strategy} \
-    actor_rollout_ref.mlp_intervention.random_seed=${random_seed} \
-    actor_rollout_ref.mlp_intervention.random_scope=${random_scope} \
-    actor_rollout_ref.mlp_intervention.weighted_max_ratio=${weighted_max_ratio} \
-    actor_rollout_ref.mlp_intervention.weighted_rank_power=${weighted_rank_power} \
-    actor_rollout_ref.mlp_intervention.random_resample_every_step=${random_resample_every_step} \
-    actor_rollout_ref.mlp_intervention.saliency_update_every_step=${saliency_update_every_step} \
-    actor_rollout_ref.mlp_intervention.saliency_ema_beta=${saliency_ema_beta} \
-    actor_rollout_ref.mlp_intervention.warmup_steps=1 \
-    actor_rollout_ref.mlp_intervention.refresh_freq=${test_and_save_freq} \
+    ${mlp_intervention_args[@]+"${mlp_intervention_args[@]}"} \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     algorithm.norm_adv_by_std_in_grpo=True \
-    algorithm.rollout_correction.bypass_old_logprob_for_rollout=False \
-    algorithm.rollout_correction.rollout_is=null \
-    algorithm.rollout_correction.rollout_rs=null \
+    ++algorithm.rollout_correction.bypass_old_logprob_for_rollout=False \
+    ++algorithm.rollout_correction.rollout_is=null \
+    ++algorithm.rollout_correction.rollout_rs=null \
     reward_model.reward_manager=naive \
     trainer.logger="['console','wandb']" \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
-    trainer.merge_duplicate_val_prompts=True \
-    trainer.validation_pass_reward_threshold=0.0 \
+    ++trainer.merge_duplicate_val_prompts=True \
+    ++trainer.validation_pass_reward_threshold=0.0 \
     trainer.n_gpus_per_node=${num_gpus} \
     trainer.nnodes=1 \
     trainer.balance_batch=True \
@@ -154,4 +173,4 @@ python3 -m recipe.mlp_channel_mask.main \
     trainer.total_epochs=${epoch} \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.resume_mode=auto \
-    +trainer.max_actor_ckpt_to_keep=1
+    ++trainer.max_actor_ckpt_to_keep=1

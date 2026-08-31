@@ -53,6 +53,17 @@ class RecipeContractTest(unittest.TestCase):
         launcher = (RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_offline.sh").read_text()
         self.assertIn("algorithm.rollout_correction.bypass_old_logprob_for_rollout=False", launcher)
 
+    def test_grpo_baseline_reuses_common_config_with_equal_rollout_budget(self) -> None:
+        baseline = (RECIPE_DIR / "baseline_grpo_qwen3-4b_offline.sh").read_text()
+        launcher = (RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_offline.sh").read_text()
+
+        self.assertIn("export mlp_intervention_enabled=False", baseline)
+        self.assertIn("export n_total=${n_total:-16}", baseline)
+        self.assertIn('exec bash "${SCRIPT_DIR}/grpo_mlp_channel_mask_qwen3-4b_offline.sh" "$@"', baseline)
+        self.assertIn("trainer_module=verl.trainer.main_ppo", launcher)
+        self.assertIn('actor_rollout_ref.rollout.n=${n_total}', launcher)
+        self.assertIn('${mlp_intervention_args[@]+"${mlp_intervention_args[@]}"}', launcher)
+
     def test_periodic_random_launcher_selects_seeded_one_percent_masks(self) -> None:
         launcher = (RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_random10_offline.sh").read_text()
         base_launcher = (RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_offline.sh").read_text()

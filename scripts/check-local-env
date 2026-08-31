@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+python_bin="${CODEX_TEST_PYTHON:-/opt/homebrew/Caskroom/miniconda/base/envs/molu/bin/python}"
+
+# Ray 2.58 otherwise inspects every parent process to detect `uv run`. That
+# sysctl call is blocked in sandboxed Codex shells and is unnecessary here.
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+
+if [[ ! -x "$python_bin" ]]; then
+  echo "Local test interpreter not found: $python_bin" >&2
+  echo "Set CODEX_TEST_PYTHON to a compatible Python interpreter." >&2
+  exit 1
+fi
+
+"$python_bin" - <<'PY'
+import hydra
+import numpy
+import omegaconf
+import pytest
+import ray
+import tensordict
+import torch
+import yaml
+
+print(f"python={__import__('sys').executable}")
+print(f"ray={ray.__version__}")
+print(f"torch={torch.__version__}")
+
+ray.init(address="local", num_cpus=1, include_dashboard=False, logging_level="ERROR")
+
+@ray.remote
+def square(value: int) -> int:
+    return value * value
+
+assert ray.get(square.remote(7)) == 49
+ray.shutdown()
+print("local Ray CPU smoke test: passed")
+PY

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+python_bin="${CODEX_TEST_PYTHON:-/opt/homebrew/Caskroom/miniconda/base/envs/molu/bin/python}"
+
+if [[ ! -x "$python_bin" ]]; then
+  echo "Local test interpreter not found: $python_bin" >&2
+  echo "Set CODEX_TEST_PYTHON to a compatible Python interpreter." >&2
+  exit 1
+fi
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+exec "$python_bin" -m pytest "$@"

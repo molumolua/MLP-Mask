@@ -25,6 +25,7 @@ class MLPChannelRarityRecipeContractTest(unittest.TestCase):
         self.assertEqual(rarity["min_loss_weight"], 0.2)
         self.assertEqual(rarity["max_loss_weight"], 5.0)
         self.assertFalse(rollout["log_prob_use_dynamic_bsz"])
+        self.assertEqual(rollout["log_prob_micro_batch_size_per_gpu"], 1)
         self.assertFalse(config["algorithm"]["rollout_correction"]["bypass_old_logprob_for_rollout"])
 
     def test_worker_piggybacks_on_logprob_and_actor_applies_one_loss_group(self) -> None:
@@ -60,6 +61,10 @@ class MLPChannelRarityRecipeContractTest(unittest.TestCase):
         self.assertIn('python_bin=${python_bin:-python}', launcher)
         self.assertIn('"${python_bin}" -m recipe.mlp_channel_rarity.main', launcher)
         self.assertIn("actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=False", launcher)
+        self.assertIn(
+            "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=",
+            launcher,
+        )
         self.assertIn("use_frequency_prior=${use_frequency_prior}", launcher)
 
 

@@ -43,6 +43,9 @@ actor_rollout_ref:
     # Rarity parts are collected in micro-batch order. Keep the old-log-prob
     # forward static until explicit dynamic-order restoration is implemented.
     log_prob_use_dynamic_bsz: false
+    # Required by the static DataProto.split path. One row per GPU is the safe
+    # default for long (prompt + response) sequences and can be overridden.
+    log_prob_micro_batch_size_per_gpu: 1
 
 algorithm:
   adv_estimator: grpo

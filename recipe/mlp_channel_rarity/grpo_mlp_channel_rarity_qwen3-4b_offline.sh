@@ -32,6 +32,7 @@ max_prompt_length=${max_prompt_length:-8192}
 max_response_length=${max_response_length:-4096}
 gpu_memory_utilization=${gpu_memory_utilization:-0.7}
 use_dynamic_bsz=${use_dynamic_bsz:-True}
+log_prob_micro_batch_size_per_gpu=${log_prob_micro_batch_size_per_gpu:-1}
 actor_ppo_max_token_len=$((2 * (max_prompt_length + max_response_length)))
 infer_ppo_max_token_len=$((2 * (max_prompt_length + max_response_length)))
 
@@ -76,6 +77,7 @@ python_bin=${python_bin:-python}
     actor_rollout_ref.rollout.n=${n_rollouts} \
     actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=False \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${log_prob_micro_batch_size_per_gpu} \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.enable_prefix_caching=True \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${tensor_model_parallel_size} \

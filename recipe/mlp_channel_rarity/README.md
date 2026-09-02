@@ -100,7 +100,8 @@ bash recipe/mlp_channel_rarity/grpo_mlp_channel_rarity_qwen3-4b_offline.sh
 `actor_rollout_ref.mlp_channel_rarity.layers=null` 表示观察全部 block；也可以在
 Hydra 参数中传入固定层列表。当前实现要求 outcome GRPO、同步 rollout、FSDP/FSDP2、
 Ulysses SP=1，并关闭 old-log-prob 的 dynamic batching，保证激活权重和 DataProto
-行顺序严格一致。
+行顺序严格一致。静态 old-log-prob micro batch 默认每 GPU 1 条；显存充足时可用
+`log_prob_micro_batch_size_per_gpu=2`（或更大值）覆盖。
 
 主要监控项：
 

@@ -53,6 +53,14 @@ class MLPChannelRarityTaskRunner:
                 "rollout.log_prob_use_dynamic_bsz must be false so collected rarity rows "
                 "preserve DataProto order"
             )
+        log_prob_micro_batch_size = config.actor_rollout_ref.rollout.get(
+            "log_prob_micro_batch_size_per_gpu", None
+        )
+        if log_prob_micro_batch_size is None or int(log_prob_micro_batch_size) <= 0:
+            raise ValueError(
+                "rollout.log_prob_micro_batch_size_per_gpu must be a positive integer "
+                "when rarity uses static old-log-prob batching"
+            )
         if int(config.actor_rollout_ref.actor.ulysses_sequence_parallel_size) != 1:
             raise NotImplementedError("MLP-channel rarity currently requires Ulysses SP size 1")
         if not bool(config.actor_rollout_ref.actor.get("force_on_policy", False)):

@@ -22,13 +22,15 @@ class RecipeContractTest(unittest.TestCase):
         self.assertEqual(rollout["n"], 16)
         self.assertEqual(intervention["n_clean"] + intervention["n_masked"], rollout["n"])
         self.assertAlmostEqual(intervention["mask_ratio"], 0.10)
-        self.assertEqual(intervention["selection_strategy"], "top_saliency")
+        self.assertEqual(intervention["selection_strategy"], "top_relative_activation")
         self.assertEqual(intervention["random_seed"], 42)
         self.assertEqual(intervention["random_scope"], "per_layer")
         self.assertEqual(intervention["weighted_max_ratio"], 4.0)
         self.assertEqual(intervention["weighted_rank_power"], 2.0)
         self.assertFalse(intervention["random_resample_every_step"])
-        self.assertFalse(intervention["saliency_update_every_step"])
+        self.assertTrue(intervention["activation_update_every_step"])
+        self.assertAlmostEqual(intervention["activation_ema_beta"], 0.95)
+        self.assertAlmostEqual(intervention["relative_activation_epsilon"], 1e-6)
         self.assertEqual(intervention["refresh_freq"], "${trainer.test_freq}")
         self.assertTrue(rollout["enable_prefix_caching"])
         self.assertFalse(
@@ -128,8 +130,8 @@ class RecipeContractTest(unittest.TestCase):
         self.assertIn("weighted_max_ratio=${weighted_max_ratio:-4.0}", launcher)
         self.assertIn("weighted_rank_power=${weighted_rank_power:-2.0}", launcher)
         self.assertIn("random_resample_every_step=${random_resample_every_step:-True}", launcher)
-        self.assertIn("saliency_update_every_step=${saliency_update_every_step:-True}", launcher)
-        self.assertIn("saliency_ema_beta=${saliency_ema_beta:-0.0}", launcher)
+        self.assertIn("activation_update_every_step=${activation_update_every_step:-True}", launcher)
+        self.assertIn("activation_ema_beta=${activation_ema_beta:-0.0}", launcher)
         self.assertNotIn("weighted_warmup", launcher)
         self.assertNotIn("weighted_warmup", base_launcher)
         self.assertIn(
@@ -141,16 +143,17 @@ class RecipeContractTest(unittest.TestCase):
             base_launcher,
         )
         self.assertIn(
-            "actor_rollout_ref.mlp_intervention.saliency_update_every_step=${saliency_update_every_step}",
+            "actor_rollout_ref.mlp_intervention.activation_update_every_step=${activation_update_every_step}",
             base_launcher,
         )
+        self.assertIn("TOP_RELATIVE_ACTIVATION_SELECTION", trainer_source)
         self.assertIn("WEIGHTED_RANDOM_SELECTION", trainer_source)
         self.assertIn("mask_prepared_for_current_step", trainer_source)
         self.assertIn(
-            "saliency_update_due = saliency_update_every_step or saliency_refresh_due",
+            "activation_update_every_step or activation_refresh_due",
             trainer_source,
         )
-        self.assertIn('timing_raw["mlp_saliency_enabled_actor_update"]', trainer_source)
+        self.assertIn('timing_raw["mlp_activation_enabled_actor_update"]', trainer_source)
 
     def test_strong_weighted_random_launcher_uses_one_plus_ten_r_squared(self) -> None:
         launcher = (
@@ -164,7 +167,7 @@ class RecipeContractTest(unittest.TestCase):
         self.assertIn("weighted_max_ratio=${weighted_max_ratio:-11.0}", launcher)
         self.assertIn("weighted_rank_power=${weighted_rank_power:-2.0}", launcher)
         self.assertIn("random_resample_every_step=${random_resample_every_step:-True}", launcher)
-        self.assertIn("saliency_update_every_step=${saliency_update_every_step:-True}", launcher)
+        self.assertIn("activation_update_every_step=${activation_update_every_step:-True}", launcher)
 
     def test_validation_merges_duplicate_prompts_and_logs_pass_at_k(self) -> None:
         config = yaml.safe_load((RECIPE_DIR / "config" / "ppo_mlp_channel_mask.yaml").read_text())
@@ -193,7 +196,7 @@ class RecipeContractTest(unittest.TestCase):
                 if stripped.startswith(("from recipe.", "import recipe.")):
                     self.assertIn("recipe.mlp_channel_mask", stripped, msg=f"{source_path}: {stripped}")
 
-    def test_actor_saliency_uses_causal_response_loss_positions(self) -> None:
+    def test_actor_activation_uses_causal_response_loss_positions(self) -> None:
         actor_source = (WORKSPACE / "verl" / "workers" / "actor" / "dp_actor.py").read_text()
         self.assertIn(
             'response_token_mask[:, -response_length - 1 : -1] = micro_batch["response_mask"]',

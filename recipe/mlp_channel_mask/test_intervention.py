@@ -1,4 +1,4 @@
-"""CPU unit tests for the recipe's mask/saliency primitives.
+"""CPU unit tests for the recipe's mask/relative-activation primitives.
 
 Run without the training stack installed:
     python3 -m unittest recipe.mlp_channel_mask.test_intervention
@@ -96,11 +96,11 @@ class MLPChannelInterventionTest(unittest.TestCase):
             num_layers=2,
             intermediate_size=10,
             mask_ratio=0.20,
-            ema_beta=0.0,
+            activation_ema_beta=0.0,
         )
 
     def _collect(self, controller, values: torch.Tensor) -> None:
-        controller.set_route(CLEAN_ROUTE, collect_saliency=True)
+        controller.set_route(CLEAN_ROUTE, collect_activation=True)
         controller.set_response_token_mask(torch.ones((1, 2)))
         loss = torch.zeros(())
         for layer_idx in range(controller.num_layers):
@@ -109,44 +109,142 @@ class MLPChannelInterventionTest(unittest.TestCase):
         loss.backward()
         controller.end_batch()
 
-    def test_top_ratio_is_selected_independently_in_every_block(self) -> None:
+    def _collect_batch(
+        self,
+        controller: MLPChannelInterventionController,
+        activation: torch.Tensor,
+        response_mask: torch.Tensor,
+    ) -> None:
+        controller.set_route(CLEAN_ROUTE, collect_activation=True)
+        controller.set_response_token_mask(response_mask)
+        loss = torch.zeros(())
+        for layer_idx in range(controller.num_layers):
+            layer_activation = activation.clone().requires_grad_(True)
+            loss = loss + controller.apply(layer_idx, layer_activation).sum()
+        loss.backward()
+        controller.end_batch()
+
+    def test_top_ratio_uses_relative_not_absolute_activation(self) -> None:
         controller = self._controller()
-        self._collect(controller, torch.arange(1, 11, dtype=torch.float32))
+        baseline = torch.tensor([100.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0])
+        current = torch.tensor([110.0, 20.0, 19.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0])
+
+        self._collect(controller, baseline)
+        first_result = controller.refresh_mask()
+        self.assertEqual(controller.current_masked_channels, 0)
+        self.assertEqual(first_result.metrics["mlp_relative_activation/initialized"], 0.0)
+
+        self._collect(controller, current)
         result = controller.refresh_mask()
 
-        self.assertEqual(controller.mask_version, 1)
+        self.assertEqual(controller.mask_version, 2)
         self.assertEqual((~controller.keep_mask).sum(dim=-1).tolist(), [2, 2])
-        self.assertEqual(torch.nonzero(~controller.keep_mask[0]).flatten().tolist(), [8, 9])
+        self.assertEqual(torch.nonzero(~controller.keep_mask[0]).flatten().tolist(), [1, 2])
+        self.assertAlmostEqual(controller.relative_activation_score[0, 0].item(), 0.1)
+        self.assertAlmostEqual(controller.relative_activation_score[0, 1].item(), 1.0)
+        self.assertAlmostEqual(controller.relative_activation_score[0, 2].item(), 0.9)
         self.assertEqual(result.metrics["mlp_mask/current_channels"], 4.0)
         self.assertEqual(result.metrics["mlp_mask/ever_unique_channels"], 4.0)
 
         controller.set_route(MASKED_ROUTE)
         masked = controller.apply(0, torch.ones((1, 10)))
-        self.assertTrue(torch.equal(masked[0, :8], torch.ones(8)))
-        self.assertTrue(torch.equal(masked[0, 8:], torch.zeros(2)))
+        self.assertEqual(masked[0].tolist(), [1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
 
-    def test_zero_ema_beta_replaces_saliency_with_current_collection(self) -> None:
+    def test_first_collection_only_initializes_activation_ema(self) -> None:
+        controller = self._controller()
+        baseline = torch.arange(1, 11, dtype=torch.float32)
+
+        self._collect(controller, baseline)
+        result = controller.refresh_mask()
+
+        self.assertTrue(torch.equal(controller.activation_ema[0], baseline))
+        self.assertFalse(controller.relative_activation_initialized)
+        self.assertEqual(controller.current_masked_channels, 0)
+        self.assertEqual(result.metrics["mlp_mask/initialized"], 0.0)
+        self.assertEqual(result.metrics["mlp_mask/current_channels"], 0.0)
+
+    def test_zero_ema_beta_scores_before_replacing_activation_baseline(self) -> None:
         controller = self._controller()
         first = torch.arange(1, 11, dtype=torch.float32)
         second = torch.flip(first, dims=(0,))
 
         self._collect(controller, first)
         controller.refresh_mask()
-        self.assertTrue(torch.equal(controller.ema_saliency[0], first))
+        self.assertTrue(torch.equal(controller.activation_ema[0], first))
 
         self._collect(controller, second)
         result = controller.refresh_mask()
-        self.assertTrue(torch.equal(controller.ema_saliency[0], second))
-        self.assertEqual(result.metrics["mlp_saliency/ema_beta"], 0.0)
+        expected_relative = (second - first) / first
+        self.assertTrue(torch.allclose(controller.relative_activation_score[0], expected_relative))
+        self.assertTrue(torch.equal(controller.activation_ema[0], second))
+        self.assertEqual(result.metrics["mlp_activation/ema_beta"], 0.0)
+
+    def test_relative_score_uses_previous_ema_then_updates_with_beta(self) -> None:
+        controller = MLPChannelInterventionController(
+            num_layers=2,
+            intermediate_size=10,
+            mask_ratio=0.20,
+            activation_ema_beta=0.5,
+        )
+        baseline = torch.full((10,), 10.0)
+        current = torch.full((10,), 20.0)
+
+        self._collect(controller, baseline)
+        controller.refresh_mask()
+        self._collect(controller, current)
+        controller.refresh_mask()
+
+        self.assertTrue(
+            torch.allclose(controller.relative_activation_score[0], torch.ones(10))
+        )
+        self.assertTrue(
+            torch.allclose(controller.activation_ema[0], torch.full((10,), 15.0))
+        )
+
+    def test_relative_score_is_finite_when_previous_activation_is_zero(self) -> None:
+        controller = MLPChannelInterventionController(
+            num_layers=2,
+            intermediate_size=10,
+            mask_ratio=0.20,
+            activation_ema_beta=0.0,
+            relative_activation_epsilon=0.5,
+        )
+        baseline = torch.zeros(10)
+        current = torch.zeros(10)
+        current[0] = 1.0
+
+        self._collect(controller, baseline)
+        controller.refresh_mask()
+        self._collect(controller, current)
+        controller.refresh_mask()
+
+        self.assertTrue(torch.isfinite(controller.relative_activation_score).all())
+        self.assertEqual(controller.relative_activation_score[0, 0].item(), 2.0)
+        self.assertEqual(controller.relative_activation_score[0, 1].item(), 0.0)
+
+    def test_activation_baseline_averages_per_sample_rms_like_rarity(self) -> None:
+        controller = self._controller()
+        activation = torch.zeros((2, 9, 10), dtype=torch.float32)
+        response_mask = torch.ones((2, 9), dtype=torch.float32)
+        response_mask[0, 1:] = 0
+        activation[0, 0, 0] = 10.0
+        activation[:, :, 1] = 4.0
+
+        self._collect_batch(controller, activation, response_mask)
+        controller.refresh_mask()
+
+        # Channel 0 has per-sample RMS values [10, 0], while channel 1 has [4, 4].
+        # The baseline is their sample mean: [5, 4], not a token-weighted global RMS.
+        self.assertEqual(controller.activation_ema[0, :2].tolist(), [5.0, 4.0])
 
     def test_default_ten_percent_masks_each_block(self) -> None:
         controller = MLPChannelInterventionController(
             num_layers=3,
             intermediate_size=10,
             mask_ratio=0.10,
-            ema_beta=0.0,
+            activation_ema_beta=0.0,
         )
-        controller.set_route(CLEAN_ROUTE, collect_saliency=True)
+        controller.set_route(CLEAN_ROUTE, collect_activation=True)
         controller.set_response_token_mask(torch.ones((1, 1)))
         loss = torch.zeros(())
         for layer_idx in range(3):
@@ -155,9 +253,11 @@ class MLPChannelInterventionTest(unittest.TestCase):
         loss.backward()
         controller.end_batch()
         controller.refresh_mask()
+        self._collect(controller, torch.arange(10, 0, -1, dtype=torch.float32))
+        controller.refresh_mask()
         self.assertEqual((~controller.keep_mask).sum(dim=-1).tolist(), [1, 1, 1])
 
-    def test_random_selection_is_exact_and_reproducible_without_saliency(self) -> None:
+    def test_random_selection_is_exact_and_reproducible_without_activation(self) -> None:
         def random_controller():
             return MLPChannelInterventionController(
                 num_layers=3,
@@ -177,7 +277,7 @@ class MLPChannelInterventionTest(unittest.TestCase):
         self.assertTrue(torch.equal(first.keep_mask, second.keep_mask))
         self.assertEqual(first_result.metrics["mlp_mask/selection_is_random"], 1.0)
         self.assertEqual(first_result.metrics["mlp_mask/random_scope_is_global"], 0.0)
-        self.assertNotIn("mlp_saliency/response_tokens", first_result.metrics)
+        self.assertNotIn("mlp_activation/response_tokens", first_result.metrics)
 
         previous_mask = first.keep_mask.clone()
         first.refresh_mask()
@@ -217,13 +317,47 @@ class MLPChannelInterventionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "random_scope"):
             per_layer.load_state_dict(first.state_dict())
 
-    def test_weighted_random_is_exact_reproducible_and_saliency_biased(self) -> None:
+    def test_legacy_random_checkpoint_remains_compatible(self) -> None:
+        controller = MLPChannelInterventionController(
+            num_layers=2,
+            intermediate_size=10,
+            mask_ratio=0.20,
+            selection_strategy=RANDOM_SELECTION,
+            random_seed=123,
+        )
+        controller.refresh_mask()
+        legacy_state = controller.state_dict()
+        for key in (
+            "score_type",
+            "activation_ema_beta",
+            "relative_activation_epsilon",
+            "activation_ema",
+            "relative_activation_score",
+            "activation_ema_initialized",
+            "relative_activation_initialized",
+        ):
+            legacy_state.pop(key)
+        legacy_state["ema_saliency"] = torch.zeros((2, 10))
+
+        restored = MLPChannelInterventionController(
+            num_layers=2,
+            intermediate_size=10,
+            mask_ratio=0.20,
+            selection_strategy=RANDOM_SELECTION,
+            random_seed=123,
+        )
+        restored.load_state_dict(legacy_state)
+
+        self.assertTrue(torch.equal(restored.keep_mask, controller.keep_mask))
+        self.assertEqual(restored.mask_version, controller.mask_version)
+
+    def test_weighted_random_is_exact_reproducible_and_relative_activation_biased(self) -> None:
         def weighted_controller():
             return MLPChannelInterventionController(
                 num_layers=2,
                 intermediate_size=20,
                 mask_ratio=0.10,
-                ema_beta=0.0,
+                activation_ema_beta=0.0,
                 selection_strategy=WEIGHTED_RANDOM_SELECTION,
                 random_seed=7,
                 weighted_max_ratio=4.0,
@@ -236,15 +370,24 @@ class MLPChannelInterventionTest(unittest.TestCase):
         second.refresh_mask()
         self.assertEqual((~first.keep_mask).sum(dim=-1).tolist(), [2, 2])
         self.assertTrue(torch.equal(first.keep_mask, second.keep_mask))
-        self.assertEqual(first_uniform.metrics["mlp_mask/weighted_used_saliency"], 0.0)
+        self.assertEqual(
+            first_uniform.metrics["mlp_mask/weighted_used_relative_activation"], 0.0
+        )
 
-        saliency = torch.arange(1, 21, dtype=torch.float32)
-        self._collect(first, saliency)
-        self._collect(second, saliency)
+        baseline = torch.ones(20, dtype=torch.float32)
+        current = torch.cat([torch.ones(10), torch.full((10,), 2.0)])
+        self._collect(first, baseline)
+        self._collect(second, baseline)
+        first.refresh_mask()
+        second.refresh_mask()
+        self._collect(first, current)
+        self._collect(second, current)
         weighted_result = first.refresh_mask()
         second.refresh_mask()
         self.assertTrue(torch.equal(first.keep_mask, second.keep_mask))
-        self.assertEqual(weighted_result.metrics["mlp_mask/weighted_used_saliency"], 1.0)
+        self.assertEqual(
+            weighted_result.metrics["mlp_mask/weighted_used_relative_activation"], 1.0
+        )
         self.assertEqual(weighted_result.metrics["mlp_mask/weighted_max_ratio"], 4.0)
         self.assertEqual(weighted_result.metrics["mlp_mask/weighted_rank_power"], 2.0)
 
@@ -258,7 +401,10 @@ class MLPChannelInterventionTest(unittest.TestCase):
         restored = weighted_controller()
         restored.load_state_dict(first.state_dict())
         self.assertTrue(torch.equal(restored.keep_mask, first.keep_mask))
-        self.assertTrue(torch.equal(restored.ema_saliency, first.ema_saliency))
+        self.assertTrue(torch.equal(restored.activation_ema, first.activation_ema))
+        self.assertTrue(
+            torch.equal(restored.relative_activation_score, first.relative_activation_score)
+        )
 
         with self.assertRaisesRegex(ValueError, "random_scope=global"):
             MLPChannelInterventionController(
@@ -270,9 +416,15 @@ class MLPChannelInterventionTest(unittest.TestCase):
 
     def test_unique_history_and_checkpoint_round_trip(self) -> None:
         controller = self._controller()
-        self._collect(controller, torch.arange(1, 11, dtype=torch.float32))
+        self._collect(controller, torch.ones(10, dtype=torch.float32))
         controller.refresh_mask()
-        self._collect(controller, torch.arange(10, 0, -1, dtype=torch.float32))
+        second = torch.ones(10, dtype=torch.float32)
+        second[-2:] = 2.0
+        self._collect(controller, second)
+        controller.refresh_mask()
+        third = second.clone()
+        third[:2] = 2.0
+        self._collect(controller, third)
         result = controller.refresh_mask()
 
         self.assertEqual(controller.current_masked_channels, 4)
@@ -284,8 +436,11 @@ class MLPChannelInterventionTest(unittest.TestCase):
         restored.load_state_dict(controller.state_dict())
         self.assertTrue(torch.equal(restored.keep_mask, controller.keep_mask))
         self.assertTrue(torch.equal(restored.ever_masked, controller.ever_masked))
-        self.assertTrue(torch.equal(restored.ema_saliency, controller.ema_saliency))
-        self.assertEqual(restored.mask_version, 2)
+        self.assertTrue(torch.equal(restored.activation_ema, controller.activation_ema))
+        self.assertTrue(
+            torch.equal(restored.relative_activation_score, controller.relative_activation_score)
+        )
+        self.assertEqual(restored.mask_version, 3)
 
     def test_dense_hf_and_vllm_instance_layouts_are_patched(self) -> None:
         hf_controller = self._controller()
@@ -411,19 +566,28 @@ class MLPChannelInterventionTest(unittest.TestCase):
             )
         )
 
-    def test_refresh_without_clean_saliency_fails_loudly(self) -> None:
-        with self.assertRaisesRegex(RuntimeError, "no clean response-token saliency"):
+    def test_refresh_without_clean_activation_fails_loudly(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "no clean response activation"):
             self._controller().refresh_mask()
 
     def test_refresh_requires_every_transformer_layer(self) -> None:
         controller = self._controller()
-        controller.set_route(CLEAN_ROUTE, collect_saliency=True)
+        controller.set_route(CLEAN_ROUTE, collect_activation=True)
         controller.set_response_token_mask(torch.ones((1, 1)))
         activation = torch.ones((1, 1, 10), requires_grad=True)
         controller.apply(0, activation).sum().backward()
         controller.end_batch()
         with self.assertRaisesRegex(RuntimeError, r"layers \[1\]"):
             controller.refresh_mask()
+
+    def test_legacy_saliency_checkpoint_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "legacy saliency checkpoint"):
+            self._controller().load_state_dict(
+                {
+                    "selection_strategy": "top_saliency",
+                    "ema_saliency": torch.zeros((2, 10)),
+                }
+            )
 
 
 if __name__ == "__main__":

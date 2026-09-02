@@ -12,7 +12,6 @@ from omegaconf import OmegaConf
 
 from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler, run_ppo
 from verl.trainer.ppo.core_algos import AdvantageEstimator
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
@@ -74,6 +73,7 @@ class MLPChannelRarityTaskRunner:
         from verl.workers.fsdp_workers import CriticWorker, RewardModelWorker
 
         from .worker import MLPChannelRarityActorRolloutRefWorker
+        from .trainer import MLPChannelRarityTrainer
 
         print(f"MLPChannelRarityTaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))
@@ -141,7 +141,7 @@ class MLPChannelRarityTaskRunner:
             resource_pool_spec=resource_pool_spec,
             mapping=self.mapping,
         )
-        trainer = RayPPOTrainer(
+        trainer = MLPChannelRarityTrainer(
             config=config,
             tokenizer=tokenizer,
             processor=processor,

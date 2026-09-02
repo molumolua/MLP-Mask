@@ -44,6 +44,7 @@ project_name=${project_name:-MLP-Channel-Rarity-4B}
 experiment_name=${experiment_name:-"grpo-${model_name}-ema-rarity-top${topk_ratio}"}
 export WANDB_RUN_ID=${WANDB_RUN_ID:-${experiment_name}}
 CKPTS_DIR=${CKPTS_DIR:-${RAY_DATA_HOME}/ckpts/${project_name}/${experiment_name}}
+rollout_data_dir=${rollout_data_dir:-${CKPTS_DIR}/rollout_data}
 
 temperature=${temperature:-1.0}
 top_p=${top_p:-1.0}
@@ -134,5 +135,6 @@ python_bin=${python_bin:-/opt/homebrew/Caskroom/miniconda/base/envs/molu/bin/pyt
     trainer.save_freq=${test_and_save_freq} \
     trainer.total_epochs=${epoch} \
     trainer.default_local_dir="${CKPTS_DIR}" \
+    trainer.rollout_data_dir="${rollout_data_dir}" \
     trainer.resume_mode=auto \
     ++trainer.max_actor_ckpt_to_keep=1

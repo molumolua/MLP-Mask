@@ -36,6 +36,18 @@ class MLPChannelRarityRecipeContractTest(unittest.TestCase):
         self.assertIn('data.non_tensor_batch["loss_multiplier"] = weights', actor)
         self.assertIn('"mlp_channel_rarity"', actor)
 
+    def test_question_rarity_dump_is_enabled_by_the_launcher(self) -> None:
+        trainer = (RECIPE_DIR / "trainer.py").read_text()
+        diagnostics = (RECIPE_DIR / "diagnostics.py").read_text()
+        launcher = (RECIPE_DIR / "grpo_mlp_channel_rarity_qwen3-4b_offline.sh").read_text()
+
+        self.assertIn("class MLPChannelRarityTrainer", trainer)
+        self.assertIn('Path(rollout_data_dir) / "question_rarity"', trainer)
+        self.assertIn('"average_accuracy"', diagnostics)
+        self.assertIn('"raw_s_q"', diagnostics)
+        self.assertIn('"s_q"', diagnostics)
+        self.assertIn('trainer.rollout_data_dir="${rollout_data_dir}"', launcher)
+
     def test_first_step_unit_weight_behavior_is_explicit(self) -> None:
         source = (RECIPE_DIR / "rarity.py").read_text()
         self.assertIn("if not self.ema_initialized:", source)

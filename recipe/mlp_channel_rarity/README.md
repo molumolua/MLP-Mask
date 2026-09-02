@@ -61,6 +61,23 @@ multiplier。第一步尚无历史 EMA，因此所有问题的 `s_q=1`；该步�
 EMA 在计算本 step deviation 之后更新，避免当前问题进入自己的基线。累计曝光、
 EMA 和 step 计数保存在 actor checkpoint 的 `mlp_channel_rarity.pt` 中。
 
+## 每步问题级 JSONL
+
+启动脚本默认设置 `trainer.rollout_data_dir` 为
+`${CKPTS_DIR}/rollout_data`。verl 原有的 response 级明细仍写到 `<step>.jsonl`；
+本 recipe 另外把同一问题的全部 GRPO response 聚合为一行，写到：
+
+```text
+${CKPTS_DIR}/rollout_data/question_rarity/<step>.jsonl
+```
+
+每行包含问题 `prompt`、`average_accuracy`、`raw_s_q`、实际 actor loss 权重
+`s_q`、各 rollout 的 accuracy/reward/rarity、数据集元信息、本实验 rarity 配置，
+以及该步完整的 `mlp_rarity/*` 统计。`average_accuracy` 使用 verifier 返回的
+`acc`；如果自定义 reward 没有返回 `acc`，该字段为 `null`，不会把可能带 shaping
+的总 reward 误当成正确率。可通过环境变量 `rollout_data_dir=/path/to/dir`
+修改输出位置。
+
 ## 启动
 
 ```bash

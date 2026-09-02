@@ -294,11 +294,9 @@ class MLPChannelInterventionController:
                 device=activation.device,
                 dtype=torch.float32,
             )
-            squared_sum.index_add_(
-                0,
-                valid_sample_ids,
-                valid_activation.to(dtype=torch.float32).square(),
-            )
+            valid_activation = valid_activation.to(dtype=torch.float32)
+            valid_activation.square_()
+            squared_sum.index_add_(0, valid_sample_ids, valid_activation)
             token_count = torch.bincount(
                 valid_sample_ids,
                 minlength=sample_count,
@@ -645,7 +643,10 @@ class MLPChannelInterventionController:
         ever_per_layer = self.ever_masked.sum(dim=-1).to(dtype=torch.float32)
         return {
             "mlp_mask/version": float(self.mask_version),
-            "mlp_mask/initialized": float(self.mask_version > 0),
+            "mlp_mask/initialized": float(current > 0),
+            "mlp_mask/selection_is_relative_activation": float(
+                self.selection_strategy == TOP_RELATIVE_ACTIVATION_SELECTION
+            ),
             "mlp_mask/selection_is_random": float(self.selection_strategy == RANDOM_SELECTION),
             "mlp_mask/selection_is_weighted_random": float(
                 self.selection_strategy == WEIGHTED_RANDOM_SELECTION
@@ -700,7 +701,12 @@ class MLPChannelInterventionController:
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         checkpoint_score_type = state.get("score_type")
-        if checkpoint_score_type != _ACTIVATION_SCORE_TYPE:
+        legacy_random_checkpoint = (
+            checkpoint_score_type is None
+            and self.selection_strategy == RANDOM_SELECTION
+            and state.get("selection_strategy") == RANDOM_SELECTION
+        )
+        if checkpoint_score_type != _ACTIVATION_SCORE_TYPE and not legacy_random_checkpoint:
             raise ValueError(
                 "MLP mask checkpoint uses an incompatible score definition "
                 f"{checkpoint_score_type!r}; expected {_ACTIVATION_SCORE_TYPE!r}. "
@@ -740,26 +746,30 @@ class MLPChannelInterventionController:
                 f"checkpoint weighted_rank_power={checkpoint_weighted_rank_power} does not match "
                 f"controller weighted_rank_power={self.weighted_rank_power}"
             )
-        checkpoint_ema_beta = float(state["activation_ema_beta"])
-        if checkpoint_ema_beta != self.activation_ema_beta:
-            raise ValueError(
-                f"checkpoint activation_ema_beta={checkpoint_ema_beta} does not match "
-                f"controller activation_ema_beta={self.activation_ema_beta}"
-            )
-        checkpoint_epsilon = float(state["relative_activation_epsilon"])
-        if checkpoint_epsilon != self.relative_activation_epsilon:
-            raise ValueError(
-                f"checkpoint relative_activation_epsilon={checkpoint_epsilon} does not match "
-                f"controller relative_activation_epsilon={self.relative_activation_epsilon}"
-            )
+        if not legacy_random_checkpoint:
+            checkpoint_ema_beta = float(state["activation_ema_beta"])
+            if checkpoint_ema_beta != self.activation_ema_beta:
+                raise ValueError(
+                    f"checkpoint activation_ema_beta={checkpoint_ema_beta} does not match "
+                    f"controller activation_ema_beta={self.activation_ema_beta}"
+                )
+            checkpoint_epsilon = float(state["relative_activation_epsilon"])
+            if checkpoint_epsilon != self.relative_activation_epsilon:
+                raise ValueError(
+                    f"checkpoint relative_activation_epsilon={checkpoint_epsilon} does not match "
+                    f"controller relative_activation_epsilon={self.relative_activation_epsilon}"
+                )
         expected = (self.num_layers, self.intermediate_size)
         keep_mask = torch.as_tensor(state["keep_mask"], dtype=torch.bool)
         if tuple(keep_mask.shape) != expected:
             raise ValueError(f"checkpoint mask shape {tuple(keep_mask.shape)} != {expected}")
         ever_masked = torch.as_tensor(state["ever_masked"], dtype=torch.bool)
-        activation_ema = torch.as_tensor(state["activation_ema"], dtype=torch.float32)
+        activation_ema = torch.as_tensor(
+            state.get("activation_ema", torch.zeros(expected)), dtype=torch.float32
+        )
         relative_activation_score = torch.as_tensor(
-            state["relative_activation_score"], dtype=torch.float32
+            state.get("relative_activation_score", torch.zeros(expected)),
+            dtype=torch.float32,
         )
         if (
             tuple(ever_masked.shape) != expected
@@ -777,7 +787,7 @@ class MLPChannelInterventionController:
         self.activation_ema.copy_(activation_ema)
         self.relative_activation_score.copy_(relative_activation_score)
         self.activation_ema_initialized = bool(
-            state.get("activation_ema_initialized", True)
+            state.get("activation_ema_initialized", False if legacy_random_checkpoint else True)
         )
         self.relative_activation_initialized = bool(
             state.get("relative_activation_initialized", False)

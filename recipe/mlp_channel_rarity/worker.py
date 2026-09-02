@@ -100,6 +100,7 @@ class MLPChannelRarityActorRolloutRefWorker(ActorRolloutRefWorker):
         output.batch["rarity_loss_weights"] = result.loss_weights.to(
             device="cpu", dtype=torch.float32
         )
+        output.meta_info["mlp_channel_rarity_metrics"] = result.metrics
         self._last_rarity_metrics = result.metrics
         return output
 

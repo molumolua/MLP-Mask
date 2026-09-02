@@ -51,7 +51,7 @@ top_p=${top_p:-1.0}
 top_k=${top_k:--1}
 val_temperature=${val_temperature:-0.6}
 val_top_p=${val_top_p:-0.95}
-python_bin=${python_bin:-/opt/homebrew/Caskroom/miniconda/base/envs/molu/bin/python}
+python_bin=${python_bin:-python}
 
 "${python_bin}" -m recipe.mlp_channel_rarity.main \
     data.train_files="${TRAIN_FILE}" \

@@ -134,9 +134,10 @@ class DataParallelPPOActor(BasePPOActor):
         response_length = micro_batch["responses"].size(-1)
         intervention_controller = getattr(self, "intervention_controller", None)
         response_token_mask = None
+        response_sample_ids = None
         if intervention_controller is not None:
             # A causal LM predicts response token j from the activation at the
-            # preceding sequence position.  Align saliency with the exact logit
+            # preceding sequence position.  Align activation collection with the exact logit
             # slice used below: [-response_length - 1 : -1].
             response_token_mask = torch.zeros_like(micro_batch["attention_mask"])
             response_token_mask[:, -response_length - 1 : -1] = micro_batch["response_mask"]
@@ -151,6 +152,12 @@ class DataParallelPPOActor(BasePPOActor):
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
+            if intervention_controller is not None:
+                response_sample_ids = torch.arange(
+                    batch_size,
+                    device=response_token_mask.device,
+                    dtype=torch.long,
+                ).unsqueeze(1).expand_as(response_token_mask)
             entropy = None
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
@@ -164,6 +171,9 @@ class DataParallelPPOActor(BasePPOActor):
                 if intervention_controller is not None:
                     response_token_mask_rmpad = index_first_axis(
                         rearrange(response_token_mask.unsqueeze(-1), "b s ... -> (b s) ..."), indices
+                    ).transpose(0, 1)
+                    response_sample_ids_rmpad = index_first_axis(
+                        rearrange(response_sample_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
                     ).transpose(0, 1)
 
                 # unpad the position_ids to align the rotary
@@ -217,9 +227,18 @@ class DataParallelPPOActor(BasePPOActor):
                             position_ids_rmpad=None,
                             sp_size=self.ulysses_sequence_parallel_size,
                         )
+                        response_sample_ids_rmpad, _, _ = ulysses_pad_and_slice_inputs(
+                            response_sample_ids_rmpad,
+                            position_ids_rmpad=None,
+                            sp_size=self.ulysses_sequence_parallel_size,
+                        )
 
                 if intervention_controller is not None:
-                    intervention_controller.set_response_token_mask(response_token_mask_rmpad)
+                    intervention_controller.set_response_token_mask(
+                        response_token_mask_rmpad,
+                        sample_ids=response_sample_ids_rmpad,
+                        sample_count=batch_size,
+                    )
 
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
 
@@ -303,7 +322,11 @@ class DataParallelPPOActor(BasePPOActor):
 
             else:  # not using rmpad and no ulysses sp
                 if intervention_controller is not None:
-                    intervention_controller.set_response_token_mask(response_token_mask)
+                    intervention_controller.set_response_token_mask(
+                        response_token_mask,
+                        sample_ids=response_sample_ids,
+                        sample_count=batch_size,
+                    )
                 extra_args = {}
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
@@ -374,7 +397,7 @@ class DataParallelPPOActor(BasePPOActor):
                 ``responses``:  tensor of shape [batch_size, response_length]. torch.int64.
 
                 ``response_mask``: tensor of shape [batch_size, response_length]. Required when an MLP intervention
-                controller is installed so activation saliency is restricted to valid response tokens.
+                controller is installed so activation statistics are restricted to valid response tokens.
 
         Returns:
             torch.Tensor: the log_prob tensor
@@ -507,7 +530,9 @@ class DataParallelPPOActor(BasePPOActor):
         if "loss_group_normalizer" in data.non_tensor_batch.keys():
             non_tensor_select_keys.append("loss_group_normalizer")
         intervention_controller = getattr(self, "intervention_controller", None)
-        collect_intervention_saliency = bool(data.meta_info.get("collect_mlp_saliency", False))
+        collect_intervention_activation = bool(
+            data.meta_info.get("collect_mlp_activation", False)
+        )
         if intervention_controller is not None:
             if "route_id" not in data.non_tensor_batch:
                 raise RuntimeError("MLP intervention actor batch is missing route_id")
@@ -620,7 +645,9 @@ class DataParallelPPOActor(BasePPOActor):
                         route_switch_started = time.perf_counter()
                         intervention_controller.set_route(
                             route_name,
-                            collect_saliency=collect_intervention_saliency and route_name == "clean",
+                            collect_activation=(
+                                collect_intervention_activation and route_name == "clean"
+                            ),
                         )
                         micro_batch_metrics[f"timing_s/mlp_mask_switch_actor_{route_name}"] = (
                             time.perf_counter() - route_switch_started

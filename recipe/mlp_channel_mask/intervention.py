@@ -1,10 +1,14 @@
-"""MLP-channel masks and clean-policy gradient x activation saliency.
+"""MLP-channel masks selected by clean-policy relative activation.
 
 The controller deliberately keeps masks outside the model state dict.  vLLM active
 buffers are registered on their MLP modules before compilation/CUDA-graph capture;
 other backends may allocate them lazily.  Route switches update each available buffer
 in place (or defer the update while vLLM sleeps), so a captured graph keeps the same
 pointer and reads new clean/masked values without recapture.
+
+For every layer and channel, the controller measures the per-response RMS activation,
+averages it across clean samples, and compares it with an EMA baseline from previous
+steps.  The largest positive relative deviations are masked before the EMA is updated.
 """
 
 from __future__ import annotations
@@ -21,11 +25,11 @@ import torch.distributed as dist
 CLEAN_ROUTE = "clean"
 MASKED_ROUTE = "masked"
 _VALID_ROUTES = {CLEAN_ROUTE, MASKED_ROUTE}
-TOP_SALIENCY_SELECTION = "top_saliency"
+TOP_RELATIVE_ACTIVATION_SELECTION = "top_relative_activation"
 RANDOM_SELECTION = "random"
 WEIGHTED_RANDOM_SELECTION = "weighted_random"
 _VALID_SELECTION_STRATEGIES = {
-    TOP_SALIENCY_SELECTION,
+    TOP_RELATIVE_ACTIVATION_SELECTION,
     RANDOM_SELECTION,
     WEIGHTED_RANDOM_SELECTION,
 }
@@ -33,6 +37,7 @@ PER_LAYER_RANDOM_SCOPE = "per_layer"
 GLOBAL_RANDOM_SCOPE = "global"
 _VALID_RANDOM_SCOPES = {PER_LAYER_RANDOM_SCOPE, GLOBAL_RANDOM_SCOPE}
 _LAYER_RE = re.compile(r"(?:^|\.)(?:layers|h)\.(\d+)\.mlp(?:\.|$)")
+_ACTIVATION_SCORE_TYPE = "relative_activation_rms_v1"
 
 
 @dataclass(frozen=True)
@@ -42,11 +47,11 @@ class MaskRefreshResult:
 
 
 class MLPChannelInterventionController:
-    """Owns per-block masks, saliency accumulators, and mask history.
+    """Own per-block masks, relative-activation statistics, and mask history.
 
     ``keep_mask[layer, channel]`` is True for an available channel and False for a
     channel removed by the structured intervention.  Masks are selected either by
-    clean policy-loss saliency or reproducible per-layer/global random sampling.
+    clean relative activation or reproducible per-layer/global random sampling.
     """
 
     def __init__(
@@ -55,8 +60,9 @@ class MLPChannelInterventionController:
         num_layers: int,
         intermediate_size: int,
         mask_ratio: float = 0.10,
-        ema_beta: float = 0.95,
-        selection_strategy: str = TOP_SALIENCY_SELECTION,
+        activation_ema_beta: float = 0.95,
+        relative_activation_epsilon: float = 1e-6,
+        selection_strategy: str = TOP_RELATIVE_ACTIVATION_SELECTION,
         random_seed: int = 42,
         random_scope: str = PER_LAYER_RANDOM_SCOPE,
         weighted_max_ratio: float = 4.0,
@@ -71,8 +77,15 @@ class MLPChannelInterventionController:
             raise ValueError(f"intermediate_size must be positive, got {intermediate_size}")
         if not 0.0 < mask_ratio < 1.0:
             raise ValueError(f"mask_ratio must be in (0, 1), got {mask_ratio}")
-        if not 0.0 <= ema_beta < 1.0:
-            raise ValueError(f"ema_beta must be in [0, 1), got {ema_beta}")
+        if not 0.0 <= activation_ema_beta < 1.0:
+            raise ValueError(
+                f"activation_ema_beta must be in [0, 1), got {activation_ema_beta}"
+            )
+        if relative_activation_epsilon <= 0.0:
+            raise ValueError(
+                "relative_activation_epsilon must be positive, got "
+                f"{relative_activation_epsilon}"
+            )
         if selection_strategy not in _VALID_SELECTION_STRATEGIES:
             raise ValueError(
                 f"selection_strategy must be one of {sorted(_VALID_SELECTION_STRATEGIES)}, "
@@ -100,7 +113,8 @@ class MLPChannelInterventionController:
         self.num_layers = int(num_layers)
         self.intermediate_size = int(intermediate_size)
         self.mask_ratio = float(mask_ratio)
-        self.ema_beta = float(ema_beta)
+        self.activation_ema_beta = float(activation_ema_beta)
+        self.relative_activation_epsilon = float(relative_activation_epsilon)
         self.selection_strategy = str(selection_strategy)
         self.random_seed = int(random_seed)
         self.random_scope = str(random_scope)
@@ -112,17 +126,24 @@ class MLPChannelInterventionController:
 
         self.keep_mask = torch.ones((self.num_layers, self.intermediate_size), dtype=torch.bool)
         self.ever_masked = torch.zeros_like(self.keep_mask)
-        self.ema_saliency = torch.zeros((self.num_layers, self.intermediate_size), dtype=torch.float32)
-        self.ema_initialized = False
+        self.activation_ema = torch.zeros(
+            (self.num_layers, self.intermediate_size), dtype=torch.float32
+        )
+        self.relative_activation_score = torch.zeros_like(self.activation_ema)
+        self.activation_ema_initialized = False
+        self.relative_activation_initialized = False
         self.mask_version = 0
         self.cumulative_mask_assignments = 0
 
         self.route = CLEAN_ROUTE
-        self.collect_saliency = False
+        self.collect_activation = False
         self._response_token_mask: torch.Tensor | None = None
-        self._saliency_sum: dict[int, torch.Tensor] = {}
-        self._saliency_token_count: torch.Tensor | None = None
-        self._saliency_accumulate_cpu_s = 0.0
+        self._response_sample_ids: torch.Tensor | None = None
+        self._response_sample_count = 0
+        self._activation_level_sum: dict[int, torch.Tensor] = {}
+        self._activation_sample_count: torch.Tensor | None = None
+        self._activation_token_count: torch.Tensor | None = None
+        self._activation_accumulate_cpu_s = 0.0
         self._active_buffers: dict[tuple[int, str, int, torch.dtype, int], torch.Tensor] = {}
         self._active_buffers_available = True
 
@@ -138,36 +159,72 @@ class MLPChannelInterventionController:
     def total_channels(self) -> int:
         return self.num_layers * self.intermediate_size
 
-    def set_route(self, route: str, *, collect_saliency: bool = False) -> None:
+    def set_route(self, route: str, *, collect_activation: bool = False) -> None:
         if route not in _VALID_ROUTES:
             raise ValueError(f"route must be one of {_VALID_ROUTES}, got {route!r}")
-        if collect_saliency and route != CLEAN_ROUTE:
-            raise ValueError("saliency may only be collected on the clean route")
-        if collect_saliency and self.selection_strategy not in {
-            TOP_SALIENCY_SELECTION,
+        if collect_activation and route != CLEAN_ROUTE:
+            raise ValueError("activation may only be collected on the clean route")
+        if collect_activation and self.selection_strategy not in {
+            TOP_RELATIVE_ACTIVATION_SELECTION,
             WEIGHTED_RANDOM_SELECTION,
         }:
-            raise ValueError("saliency collection requires top_saliency or weighted_random selection")
+            raise ValueError(
+                "activation collection requires top_relative_activation or weighted_random selection"
+            )
         self.route = route
-        self.collect_saliency = bool(collect_saliency)
+        self.collect_activation = bool(collect_activation)
         self._response_token_mask = None
+        self._response_sample_ids = None
+        self._response_sample_count = 0
         self._refresh_active_buffers()
 
-    def set_response_token_mask(self, response_token_mask: torch.Tensor) -> None:
-        """Set the response-token mask matching the leading activation dimensions."""
+    def set_response_token_mask(
+        self,
+        response_token_mask: torch.Tensor,
+        *,
+        sample_ids: torch.Tensor | None = None,
+        sample_count: int | None = None,
+    ) -> None:
+        """Set valid response positions and their sample IDs for RMS reduction."""
         self._response_token_mask = response_token_mask.detach()
-        if self.collect_saliency:
-            count = self._response_token_mask.to(dtype=torch.float32).sum()
-            if self._saliency_token_count is None:
-                self._saliency_token_count = torch.zeros((), device=count.device, dtype=torch.float32)
-            self._saliency_token_count.add_(count)
+        if sample_ids is None:
+            if self._response_token_mask.ndim == 0:
+                raise ValueError("response_token_mask must have at least one dimension")
+            inferred_samples = int(self._response_token_mask.shape[0])
+            view_shape = (inferred_samples,) + (1,) * (self._response_token_mask.ndim - 1)
+            sample_ids = torch.arange(
+                inferred_samples,
+                device=self._response_token_mask.device,
+                dtype=torch.long,
+            ).view(view_shape).expand_as(self._response_token_mask)
+            sample_count = inferred_samples
+        elif sample_ids.shape != self._response_token_mask.shape:
+            raise ValueError(
+                f"sample_ids shape {tuple(sample_ids.shape)} does not match response mask "
+                f"{tuple(self._response_token_mask.shape)}"
+            )
+        if sample_count is None or sample_count <= 0:
+            raise ValueError(f"sample_count must be positive, got {sample_count}")
+        self._response_sample_ids = sample_ids.detach().to(dtype=torch.long)
+        self._response_sample_count = int(sample_count)
+        if self.collect_activation:
+            device = self._response_token_mask.device
+            if self._activation_sample_count is None:
+                self._activation_sample_count = torch.zeros((), device=device, dtype=torch.float32)
+                self._activation_token_count = torch.zeros((), device=device, dtype=torch.float32)
+            self._activation_sample_count.add_(float(self._response_sample_count))
+            self._activation_token_count.add_(
+                self._response_token_mask.to(dtype=torch.float32).sum()
+            )
 
     def end_batch(self) -> None:
-        self.collect_saliency = False
+        self.collect_activation = False
         self._response_token_mask = None
+        self._response_sample_ids = None
+        self._response_sample_count = 0
 
     def apply(self, layer_idx: int, activation: torch.Tensor) -> torch.Tensor:
-        """Apply the active route and optionally attach a clean saliency hook."""
+        """Apply the route and optionally collect clean response activation RMS."""
         if not 0 <= layer_idx < self.num_layers:
             raise IndexError(f"layer {layer_idx} outside [0, {self.num_layers})")
         if activation.shape[-1] not in {
@@ -179,25 +236,32 @@ class MLPChannelInterventionController:
                 f"{self.intermediate_size} or TP-local {self.intermediate_size // self.tp_size}"
             )
 
-        if self.collect_saliency and activation.requires_grad:
-            if self._response_token_mask is None:
-                raise RuntimeError("clean saliency requested before response token mask was installed")
+        if self.collect_activation and activation.requires_grad:
+            if self._response_token_mask is None or self._response_sample_ids is None:
+                raise RuntimeError("clean activation requested before response metadata was installed")
             token_mask = self._response_token_mask
+            sample_ids = self._response_sample_ids
+            sample_count = self._response_sample_count
+            # The backward hook is only a once-per-forward lifecycle trigger.  The
+            # score uses activation alone; the gradient value is intentionally ignored.
+            # This avoids double-counting gradient-checkpoint recomputation.
             activation.register_hook(
-                lambda grad, a=activation.detach(), m=token_mask, layer=layer_idx: self._accumulate_saliency(
-                    layer, a, grad, m
+                lambda _grad, a=activation.detach(), m=token_mask, ids=sample_ids, count=sample_count,
+                layer=layer_idx: self._accumulate_activation(
+                    layer, a, m, ids, count
                 )
             )
 
         active_mask = self._get_active_buffer(layer_idx, activation)
         return activation * active_mask
 
-    def _accumulate_saliency(
+    def _accumulate_activation(
         self,
         layer_idx: int,
         activation: torch.Tensor,
-        grad: torch.Tensor,
         token_mask: torch.Tensor,
+        sample_ids: torch.Tensor,
+        sample_count: int,
     ) -> None:
         accumulate_started = time.perf_counter()
         with torch.no_grad():
@@ -207,25 +271,63 @@ class MLPChannelInterventionController:
                     f"response mask has {token_mask.numel()} entries but layer {layer_idx} activation "
                     f"has leading shape {tuple(expected_shape)}"
                 )
-            weights = token_mask.reshape(expected_shape).to(device=activation.device, dtype=activation.dtype)
-            contribution = (activation * grad).abs() * weights.unsqueeze(-1)
-            reduce_dims = tuple(range(contribution.ndim - 1))
-            score = contribution.sum(dim=reduce_dims, dtype=torch.float32)
+            if sample_ids.numel() != token_mask.numel():
+                raise RuntimeError(
+                    f"response sample IDs have {sample_ids.numel()} entries but token mask has "
+                    f"{token_mask.numel()}"
+                )
+            flat_mask = token_mask.reshape(-1).to(device=activation.device, dtype=torch.bool)
+            flat_sample_ids = sample_ids.reshape(-1).to(device=activation.device, dtype=torch.long)
+            flat_activation = activation.reshape(-1, activation.shape[-1])
+            valid_activation = flat_activation[flat_mask]
+            valid_sample_ids = flat_sample_ids[flat_mask]
+            if valid_activation.numel() == 0:
+                raise RuntimeError("clean activation batch contains no valid response tokens")
+            if (
+                int(valid_sample_ids.min().item()) < 0
+                or int(valid_sample_ids.max().item()) >= sample_count
+            ):
+                raise RuntimeError("response sample IDs are outside the current micro-batch")
+
+            squared_sum = torch.zeros(
+                (sample_count, activation.shape[-1]),
+                device=activation.device,
+                dtype=torch.float32,
+            )
+            squared_sum.index_add_(
+                0,
+                valid_sample_ids,
+                valid_activation.to(dtype=torch.float32).square(),
+            )
+            token_count = torch.bincount(
+                valid_sample_ids,
+                minlength=sample_count,
+            ).to(device=activation.device, dtype=torch.float32)
+            if bool((token_count == 0).any().item()):
+                missing = torch.nonzero(token_count == 0).flatten().tolist()
+                raise RuntimeError(f"clean samples without response tokens: {missing}")
+            activation_level_sum = torch.sqrt(
+                squared_sum / token_count.unsqueeze(-1).clamp_min(1.0)
+            ).sum(dim=0)
 
             # Actor/HF activations are expected to be full-width.  Supporting a local
             # width here also makes the controller testable and future-proofs TP actors.
-            if score.numel() != self.intermediate_size:
-                full_score = torch.zeros(self.intermediate_size, device=score.device, dtype=torch.float32)
-                start, stop = self._local_slice(score.numel())
-                full_score[start:stop] = score
-                score = full_score
-            accumulator = self._saliency_sum.get(layer_idx)
-            if accumulator is None or accumulator.device != score.device:
-                accumulator = torch.zeros_like(score)
-                self._saliency_sum[layer_idx] = accumulator
-            accumulator.add_(score)
+            if activation_level_sum.numel() != self.intermediate_size:
+                full_sum = torch.zeros(
+                    self.intermediate_size,
+                    device=activation_level_sum.device,
+                    dtype=torch.float32,
+                )
+                start, stop = self._local_slice(activation_level_sum.numel())
+                full_sum[start:stop] = activation_level_sum
+                activation_level_sum = full_sum
+            accumulator = self._activation_level_sum.get(layer_idx)
+            if accumulator is None or accumulator.device != activation_level_sum.device:
+                accumulator = torch.zeros_like(activation_level_sum)
+                self._activation_level_sum[layer_idx] = accumulator
+            accumulator.add_(activation_level_sum)
         # This is host dispatch time; GPU work remains included in update_actor.
-        self._saliency_accumulate_cpu_s += time.perf_counter() - accumulate_started
+        self._activation_accumulate_cpu_s += time.perf_counter() - accumulate_started
 
     def _buffer_key(self, layer_idx: int, activation: torch.Tensor) -> tuple[int, str, int, torch.dtype, int]:
         device = activation.device
@@ -301,22 +403,26 @@ class MLPChannelInterventionController:
             self._copy_route_to_buffer(key[0], buffer)
 
     def refresh_mask(self) -> MaskRefreshResult:
-        """Select an exact per-block mask using saliency or seeded random sampling."""
+        """Select a per-block mask from relative activation or seeded randomness."""
         refresh_started = time.perf_counter()
         reduce_elapsed = 0.0
-        saliency_metrics: dict[str, float] = {}
-        uses_saliency = self.selection_strategy in {
-            TOP_SALIENCY_SELECTION,
+        activation_metrics: dict[str, float] = {}
+        uses_activation = self.selection_strategy in {
+            TOP_RELATIVE_ACTIVATION_SELECTION,
             WEIGHTED_RANDOM_SELECTION,
         }
-        has_pending_saliency = self._saliency_token_count is not None or bool(self._saliency_sum)
-        if uses_saliency and (
-            self.selection_strategy == TOP_SALIENCY_SELECTION or has_pending_saliency
+        has_pending_activation = (
+            self._activation_sample_count is not None or bool(self._activation_level_sum)
+        )
+        batch_activation_cpu: torch.Tensor | None = None
+        if uses_activation and (
+            self.selection_strategy == TOP_RELATIVE_ACTIVATION_SELECTION
+            or has_pending_activation
         ):
             device = self._score_device()
-            saliency = torch.stack(
+            activation_level_sum = torch.stack(
                 [
-                    self._saliency_sum.get(
+                    self._activation_level_sum.get(
                         layer_idx,
                         torch.zeros(self.intermediate_size, device=device, dtype=torch.float32),
                     ).to(device)
@@ -324,50 +430,76 @@ class MLPChannelInterventionController:
                 ],
                 dim=0,
             )
+            sample_count = (
+                self._activation_sample_count.to(device)
+                if self._activation_sample_count is not None
+                else torch.zeros((), device=device, dtype=torch.float32)
+            )
             token_count = (
-                self._saliency_token_count.to(device)
-                if self._saliency_token_count is not None
+                self._activation_token_count.to(device)
+                if self._activation_token_count is not None
                 else torch.zeros((), device=device, dtype=torch.float32)
             )
             observed_layers = torch.tensor(
-                [float(layer_idx in self._saliency_sum) for layer_idx in range(self.num_layers)],
+                [
+                    float(layer_idx in self._activation_level_sum)
+                    for layer_idx in range(self.num_layers)
+                ],
                 device=device,
                 dtype=torch.float32,
             )
 
             reduce_started = time.perf_counter()
             if dist.is_available() and dist.is_initialized():
-                dist.all_reduce(saliency, op=dist.ReduceOp.SUM)
+                dist.all_reduce(activation_level_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(sample_count, op=dist.ReduceOp.SUM)
                 dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
                 dist.all_reduce(observed_layers, op=dist.ReduceOp.SUM)
             reduce_elapsed = time.perf_counter() - reduce_started
-            if float(token_count.item()) <= 0:
-                raise RuntimeError("cannot refresh MLP mask: no clean response-token saliency was accumulated")
+            if float(sample_count.item()) <= 0 or float(token_count.item()) <= 0:
+                raise RuntimeError(
+                    "cannot refresh MLP mask: no clean response activation was accumulated"
+                )
             if bool((observed_layers == 0).any().item()):
                 missing = torch.nonzero(observed_layers == 0).flatten().cpu().tolist()
-                raise RuntimeError(f"cannot refresh MLP mask: no saliency hook fired for layers {missing}")
-            interval_cpu = (saliency / token_count.clamp_min(1.0)).cpu()
-            if self.ema_initialized:
-                self.ema_saliency.mul_(self.ema_beta).add_(interval_cpu, alpha=1.0 - self.ema_beta)
+                raise RuntimeError(
+                    f"cannot refresh MLP mask: no activation hook fired for layers {missing}"
+                )
+            batch_activation_cpu = (
+                activation_level_sum / sample_count.clamp_min(1.0)
+            ).cpu()
+            baseline_was_initialized = self.activation_ema_initialized
+            if baseline_was_initialized:
+                denominator = self.activation_ema.clamp_min(
+                    self.relative_activation_epsilon
+                )
+                self.relative_activation_score.copy_(
+                    (batch_activation_cpu - self.activation_ema) / denominator
+                )
+                self.relative_activation_initialized = True
             else:
-                self.ema_saliency.copy_(interval_cpu)
-                self.ema_initialized = True
-            saliency_metrics = {
-                "mlp_saliency/mean": float(self.ema_saliency.mean().item()),
-                "mlp_saliency/max": float(self.ema_saliency.max().item()),
-                "mlp_saliency/min": float(self.ema_saliency.min().item()),
-                "mlp_saliency/response_tokens": float(token_count.item()),
-                "mlp_saliency/layers_observed": float((observed_layers > 0).sum().item()),
-                "mlp_saliency/updated_on_refresh": 1.0,
+                self.relative_activation_score.zero_()
+            activation_metrics = {
+                "mlp_activation/current_rms_mean": float(batch_activation_cpu.mean().item()),
+                "mlp_activation/current_rms_max": float(batch_activation_cpu.max().item()),
+                "mlp_activation/current_rms_min": float(batch_activation_cpu.min().item()),
+                "mlp_activation/response_samples": float(sample_count.item()),
+                "mlp_activation/response_tokens": float(token_count.item()),
+                "mlp_activation/layers_observed": float((observed_layers > 0).sum().item()),
+                "mlp_activation/updated_on_refresh": 1.0,
+                "mlp_activation/baseline_initialized_before_refresh": float(
+                    baseline_was_initialized
+                ),
             }
         elif self.selection_strategy == WEIGHTED_RANDOM_SELECTION:
-            saliency_metrics = {
-                "mlp_saliency/mean": float(self.ema_saliency.mean().item()),
-                "mlp_saliency/max": float(self.ema_saliency.max().item()),
-                "mlp_saliency/min": float(self.ema_saliency.min().item()),
-                "mlp_saliency/response_tokens": 0.0,
-                "mlp_saliency/layers_observed": 0.0,
-                "mlp_saliency/updated_on_refresh": 0.0,
+            activation_metrics = {
+                "mlp_activation/response_samples": 0.0,
+                "mlp_activation/response_tokens": 0.0,
+                "mlp_activation/layers_observed": 0.0,
+                "mlp_activation/updated_on_refresh": 0.0,
+                "mlp_activation/baseline_initialized_before_refresh": float(
+                    self.activation_ema_initialized
+                ),
             }
 
         select_started = time.perf_counter()
@@ -376,20 +508,26 @@ class MLPChannelInterventionController:
         old_masked = ~self.keep_mask
         new_keep = torch.ones_like(self.keep_mask)
         weighted_selected_ranks: list[torch.Tensor] = []
-        if self.selection_strategy == TOP_SALIENCY_SELECTION:
-            for layer_idx in range(self.num_layers):
-                top_idx = torch.topk(
-                    self.ema_saliency[layer_idx], k=masked_per_layer, largest=True, sorted=False
-                ).indices
-                new_keep[layer_idx, top_idx] = False
+        if self.selection_strategy == TOP_RELATIVE_ACTIVATION_SELECTION:
+            # The first observation only establishes the normal-activation EMA.
+            # Masking begins once a later batch can be compared with that baseline.
+            if self.relative_activation_initialized:
+                for layer_idx in range(self.num_layers):
+                    top_idx = torch.topk(
+                        self.relative_activation_score[layer_idx],
+                        k=masked_per_layer,
+                        largest=True,
+                        sorted=False,
+                    ).indices
+                    new_keep[layer_idx, top_idx] = False
         elif self.selection_strategy == WEIGHTED_RANDOM_SELECTION:
             generator = torch.Generator(device="cpu")
             generator.manual_seed(self.random_seed + self.mask_version)
             for layer_idx in range(self.num_layers):
-                if not self.ema_initialized:
+                if not self.relative_activation_initialized:
                     selected = torch.randperm(self.intermediate_size, generator=generator)[:masked_per_layer]
                 else:
-                    order = torch.argsort(self.ema_saliency[layer_idx])
+                    order = torch.argsort(self.relative_activation_score[layer_idx])
                     rank = torch.empty(self.intermediate_size, dtype=torch.float32)
                     rank[order] = torch.arange(self.intermediate_size, dtype=torch.float32)
                     rank.div_(max(self.intermediate_size - 1, 1))
@@ -434,15 +572,30 @@ class MLPChannelInterventionController:
         self._refresh_active_buffers()
         select_elapsed = time.perf_counter() - select_started
 
-        self._saliency_sum.clear()
-        self._saliency_token_count = None
+        # Match mlp_channel_rarity: score against the previous baseline first,
+        # then update the baseline so the current batch cannot normalize itself.
+        if batch_activation_cpu is not None:
+            if self.activation_ema_initialized:
+                self.activation_ema.mul_(self.activation_ema_beta).add_(
+                    batch_activation_cpu,
+                    alpha=1.0 - self.activation_ema_beta,
+                )
+            else:
+                self.activation_ema.copy_(batch_activation_cpu)
+                self.activation_ema_initialized = True
+
+        self._activation_level_sum.clear()
+        self._activation_sample_count = None
+        self._activation_token_count = None
 
         metrics = self.metrics()
         metrics.update(
             {
                 "mlp_mask/new_unique_channels": float(new_unique),
                 "mlp_mask/overlap_with_previous": float(overlap),
-                "mlp_mask/turnover_fraction": float(1.0 - overlap / max(current, 1)),
+                "mlp_mask/turnover_fraction": float(
+                    0.0 if current == 0 else 1.0 - overlap / current
+                ),
             }
         )
         if weighted_selected_ranks:
@@ -453,19 +606,36 @@ class MLPChannelInterventionController:
                     "mlp_mask/weighted_selected_top_1pct_fraction": float(
                         (selected_ranks >= 0.99).to(dtype=torch.float32).mean().item()
                     ),
-                    "mlp_mask/weighted_used_saliency": 1.0,
+                    "mlp_mask/weighted_used_relative_activation": 1.0,
                 }
             )
         elif self.selection_strategy == WEIGHTED_RANDOM_SELECTION:
-            metrics["mlp_mask/weighted_used_saliency"] = 0.0
-        metrics.update(saliency_metrics)
+            metrics["mlp_mask/weighted_used_relative_activation"] = 0.0
+        metrics.update(activation_metrics)
+        if uses_activation:
+            metrics.update(
+                {
+                    "mlp_activation/ema_mean": float(self.activation_ema.mean().item()),
+                    "mlp_activation/ema_max": float(self.activation_ema.max().item()),
+                    "mlp_activation/ema_min": float(self.activation_ema.min().item()),
+                    "mlp_relative_activation/mean": float(
+                        self.relative_activation_score.mean().item()
+                    ),
+                    "mlp_relative_activation/max": float(
+                        self.relative_activation_score.max().item()
+                    ),
+                    "mlp_relative_activation/min": float(
+                        self.relative_activation_score.min().item()
+                    ),
+                }
+            )
         timings = {
-            "mlp_saliency_accumulate_cpu": self._saliency_accumulate_cpu_s,
-            "mlp_saliency_reduce": reduce_elapsed,
+            "mlp_activation_accumulate_cpu": self._activation_accumulate_cpu_s,
+            "mlp_activation_reduce": reduce_elapsed,
             "mlp_mask_select": select_elapsed,
             "mlp_mask_refresh": time.perf_counter() - refresh_started,
         }
-        self._saliency_accumulate_cpu_s = 0.0
+        self._activation_accumulate_cpu_s = 0.0
         return MaskRefreshResult(metrics=metrics, timings=timings)
 
     def metrics(self) -> dict[str, float]:
@@ -484,7 +654,12 @@ class MLPChannelInterventionController:
             "mlp_mask/random_seed": float(self.random_seed),
             "mlp_mask/weighted_max_ratio": float(self.weighted_max_ratio),
             "mlp_mask/weighted_rank_power": float(self.weighted_rank_power),
-            "mlp_saliency/ema_beta": float(self.ema_beta),
+            "mlp_activation/ema_beta": float(self.activation_ema_beta),
+            "mlp_activation/relative_epsilon": float(self.relative_activation_epsilon),
+            "mlp_activation/ema_initialized": float(self.activation_ema_initialized),
+            "mlp_relative_activation/initialized": float(
+                self.relative_activation_initialized
+            ),
             "mlp_mask/layers": float(self.num_layers),
             "mlp_mask/channels_per_layer": float(self.intermediate_size),
             "mlp_mask/masked_per_layer": float(current / self.num_layers),
@@ -502,10 +677,12 @@ class MLPChannelInterventionController:
 
     def state_dict(self) -> dict[str, Any]:
         return {
+            "score_type": _ACTIVATION_SCORE_TYPE,
             "num_layers": self.num_layers,
             "intermediate_size": self.intermediate_size,
             "mask_ratio": self.mask_ratio,
-            "ema_beta": self.ema_beta,
+            "activation_ema_beta": self.activation_ema_beta,
+            "relative_activation_epsilon": self.relative_activation_epsilon,
             "selection_strategy": self.selection_strategy,
             "random_seed": self.random_seed,
             "random_scope": self.random_scope,
@@ -513,13 +690,22 @@ class MLPChannelInterventionController:
             "weighted_rank_power": self.weighted_rank_power,
             "keep_mask": self.keep_mask.cpu(),
             "ever_masked": self.ever_masked.cpu(),
-            "ema_saliency": self.ema_saliency.cpu(),
-            "ema_initialized": self.ema_initialized,
+            "activation_ema": self.activation_ema.cpu(),
+            "relative_activation_score": self.relative_activation_score.cpu(),
+            "activation_ema_initialized": self.activation_ema_initialized,
+            "relative_activation_initialized": self.relative_activation_initialized,
             "mask_version": self.mask_version,
             "cumulative_mask_assignments": self.cumulative_mask_assignments,
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
+        checkpoint_score_type = state.get("score_type")
+        if checkpoint_score_type != _ACTIVATION_SCORE_TYPE:
+            raise ValueError(
+                "MLP mask checkpoint uses an incompatible score definition "
+                f"{checkpoint_score_type!r}; expected {_ACTIVATION_SCORE_TYPE!r}. "
+                "Start a new run instead of resuming a legacy saliency checkpoint."
+            )
         checkpoint_strategy = str(state.get("selection_strategy", self.selection_strategy))
         if checkpoint_strategy != self.selection_strategy:
             raise ValueError(
@@ -554,21 +740,48 @@ class MLPChannelInterventionController:
                 f"checkpoint weighted_rank_power={checkpoint_weighted_rank_power} does not match "
                 f"controller weighted_rank_power={self.weighted_rank_power}"
             )
+        checkpoint_ema_beta = float(state["activation_ema_beta"])
+        if checkpoint_ema_beta != self.activation_ema_beta:
+            raise ValueError(
+                f"checkpoint activation_ema_beta={checkpoint_ema_beta} does not match "
+                f"controller activation_ema_beta={self.activation_ema_beta}"
+            )
+        checkpoint_epsilon = float(state["relative_activation_epsilon"])
+        if checkpoint_epsilon != self.relative_activation_epsilon:
+            raise ValueError(
+                f"checkpoint relative_activation_epsilon={checkpoint_epsilon} does not match "
+                f"controller relative_activation_epsilon={self.relative_activation_epsilon}"
+            )
         expected = (self.num_layers, self.intermediate_size)
         keep_mask = torch.as_tensor(state["keep_mask"], dtype=torch.bool)
         if tuple(keep_mask.shape) != expected:
             raise ValueError(f"checkpoint mask shape {tuple(keep_mask.shape)} != {expected}")
         ever_masked = torch.as_tensor(state["ever_masked"], dtype=torch.bool)
-        ema_saliency = torch.as_tensor(state["ema_saliency"], dtype=torch.float32)
-        if tuple(ever_masked.shape) != expected or tuple(ema_saliency.shape) != expected:
+        activation_ema = torch.as_tensor(state["activation_ema"], dtype=torch.float32)
+        relative_activation_score = torch.as_tensor(
+            state["relative_activation_score"], dtype=torch.float32
+        )
+        if (
+            tuple(ever_masked.shape) != expected
+            or tuple(activation_ema.shape) != expected
+            or tuple(relative_activation_score.shape) != expected
+        ):
             raise ValueError(
-                "checkpoint history/saliency shapes must match controller shape "
-                f"{expected}, got ever={tuple(ever_masked.shape)}, ema={tuple(ema_saliency.shape)}"
+                "checkpoint history/activation shapes must match controller shape "
+                f"{expected}, got ever={tuple(ever_masked.shape)}, "
+                f"ema={tuple(activation_ema.shape)}, "
+                f"relative={tuple(relative_activation_score.shape)}"
             )
         self.keep_mask.copy_(keep_mask)
         self.ever_masked.copy_(ever_masked)
-        self.ema_saliency.copy_(ema_saliency)
-        self.ema_initialized = bool(state.get("ema_initialized", True))
+        self.activation_ema.copy_(activation_ema)
+        self.relative_activation_score.copy_(relative_activation_score)
+        self.activation_ema_initialized = bool(
+            state.get("activation_ema_initialized", True)
+        )
+        self.relative_activation_initialized = bool(
+            state.get("relative_activation_initialized", False)
+        )
         self.mask_version = int(state.get("mask_version", 0))
         self.cumulative_mask_assignments = int(state.get("cumulative_mask_assignments", 0))
         self._refresh_active_buffers()
@@ -577,8 +790,8 @@ class MLPChannelInterventionController:
         self.load_state_dict(other.state_dict())
 
     def _score_device(self) -> torch.device:
-        if self._saliency_sum:
-            return next(iter(self._saliency_sum.values())).device
+        if self._activation_level_sum:
+            return next(iter(self._activation_level_sum.values())).device
         if torch.cuda.is_available():
             return torch.device("cuda", torch.cuda.current_device())
         return torch.device("cpu")

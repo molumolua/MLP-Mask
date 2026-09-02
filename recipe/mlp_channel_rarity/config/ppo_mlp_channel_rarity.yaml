@@ -1,0 +1,61 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+actor_rollout_ref:
+  mlp_channel_rarity:
+    enabled: true
+    # null observes every transformer block; pass e.g. [8, 16, 24, 32] to
+    # restrict the score to a smaller layer subset.
+    layers: null
+    activation_ema_beta: 0.95
+    topk_ratio: 0.01
+    # When non-null, top_k overrides topk_ratio.
+    top_k: null
+    deviation_epsilon: 1.0e-6
+    frequency_epsilon: 1.0e-8
+    # Off by default: use the raw cumulative question frequency C/N.
+    use_frequency_prior: false
+    # Symmetric pseudo-question count centered at top_k / intermediate_size.
+    # It suppresses high-variance -log(f) values during early training.
+    frequency_prior_strength: 64.0
+    # A second safety bound on the per-channel self-information.
+    max_channel_rarity: 8.0
+    # Scores are projected into this interval with global mean exactly one.
+    min_loss_weight: 0.2
+    max_loss_weight: 5.0
+
+  actor:
+    force_on_policy: true
+    use_rollout_log_probs: true
+    ppo_epochs: 1
+    ulysses_sequence_parallel_size: 1
+
+  rollout:
+    name: vllm
+    mode: sync
+    n: 16
+    calculate_log_probs: true
+    # Rarity parts are collected in micro-batch order. Keep the old-log-prob
+    # forward static until explicit dynamic-order restoration is implemented.
+    log_prob_use_dynamic_bsz: false
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  rollout_correction:
+    bypass_old_logprob_for_rollout: false
+    rollout_is: null
+    rollout_rs: null
+
+reward_model:
+  reward_manager: naive
+
+trainer:
+  project_name: MLP-Channel-Rarity
+  merge_duplicate_val_prompts: true
+  validation_pass_reward_threshold: 0.0

@@ -49,8 +49,13 @@ class MLPChannelActorRolloutRefWorker(ActorRolloutRefWorker):
             num_layers=int(self.actor_model_config.num_hidden_layers),
             intermediate_size=int(self.actor_model_config.intermediate_size),
             mask_ratio=float(config.get("mask_ratio", 0.10)),
-            ema_beta=float(config.get("saliency_ema_beta", 0.95)),
-            selection_strategy=str(config.get("selection_strategy", "top_saliency")),
+            activation_ema_beta=float(config.get("activation_ema_beta", 0.95)),
+            relative_activation_epsilon=float(
+                config.get("relative_activation_epsilon", 1e-6)
+            ),
+            selection_strategy=str(
+                config.get("selection_strategy", "top_relative_activation")
+            ),
             random_seed=int(config.get("random_seed", 42)),
             random_scope=str(config.get("random_scope", "per_layer")),
             weighted_max_ratio=float(config.get("weighted_max_ratio", 4.0)),

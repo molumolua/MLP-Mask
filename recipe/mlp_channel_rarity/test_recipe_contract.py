@@ -22,6 +22,7 @@ class MLPChannelRarityRecipeContractTest(unittest.TestCase):
         self.assertEqual(rarity["frequency_prior_strength"], 64.0)
         self.assertEqual(rarity["max_channel_rarity"], 8.0)
         self.assertFalse(rarity["use_frequency_prior"])
+        self.assertEqual(rarity["loss_weight_amplification"], 1.0)
         self.assertEqual(rarity["min_loss_weight"], 0.2)
         self.assertEqual(rarity["max_loss_weight"], 5.0)
         self.assertFalse(rollout["log_prob_use_dynamic_bsz"])
@@ -66,6 +67,20 @@ class MLPChannelRarityRecipeContractTest(unittest.TestCase):
             launcher,
         )
         self.assertIn("use_frequency_prior=${use_frequency_prior}", launcher)
+        self.assertIn("loss_weight_amplification=${loss_weight_amplification}", launcher)
+
+    def test_amplified_launcher_selects_tenfold_point_two_to_five_weights(self) -> None:
+        launcher = (
+            RECIPE_DIR / "grpo_mlp_channel_rarity_qwen3-4b_amplified_offline.sh"
+        ).read_text()
+
+        self.assertIn(
+            "loss_weight_amplification=${loss_weight_amplification:-10.0}",
+            launcher,
+        )
+        self.assertIn("min_loss_weight=${min_loss_weight:-0.2}", launcher)
+        self.assertIn("max_loss_weight=${max_loss_weight:-5.0}", launcher)
+        self.assertIn("grpo_mlp_channel_rarity_qwen3-4b_offline.sh", launcher)
 
 
 if __name__ == "__main__":

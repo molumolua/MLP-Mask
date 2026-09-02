@@ -17,6 +17,7 @@ topk_ratio=${topk_ratio:-0.01}
 frequency_prior_strength=${frequency_prior_strength:-64.0}
 max_channel_rarity=${max_channel_rarity:-8.0}
 use_frequency_prior=${use_frequency_prior:-False}
+loss_weight_amplification=${loss_weight_amplification:-1.0}
 min_loss_weight=${min_loss_weight:-0.2}
 max_loss_weight=${max_loss_weight:-5.0}
 
@@ -115,6 +116,7 @@ python_bin=${python_bin:-python}
     actor_rollout_ref.mlp_channel_rarity.frequency_prior_strength=${frequency_prior_strength} \
     actor_rollout_ref.mlp_channel_rarity.max_channel_rarity=${max_channel_rarity} \
     actor_rollout_ref.mlp_channel_rarity.use_frequency_prior=${use_frequency_prior} \
+    actor_rollout_ref.mlp_channel_rarity.loss_weight_amplification=${loss_weight_amplification} \
     actor_rollout_ref.mlp_channel_rarity.min_loss_weight=${min_loss_weight} \
     actor_rollout_ref.mlp_channel_rarity.max_loss_weight=${max_loss_weight} \
     algorithm.adv_estimator=grpo \

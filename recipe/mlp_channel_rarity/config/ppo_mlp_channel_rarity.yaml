@@ -25,6 +25,9 @@ actor_rollout_ref:
     frequency_prior_strength: 64.0
     # A second safety bound on the per-channel self-information.
     max_channel_rarity: 8.0
+    # Amplify normalized score deviations around one before bounded projection.
+    # 1.0 exactly preserves the original weighting behavior.
+    loss_weight_amplification: 1.0
     # Scores are projected into this interval with global mean exactly one.
     min_loss_weight: 0.2
     max_loss_weight: 5.0

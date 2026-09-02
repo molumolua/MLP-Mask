@@ -161,6 +161,49 @@ class MLPChannelRarityControllerTest(unittest.TestCase):
         self.assertLessEqual(float(weights.max()), 5.0)
         self.assertAlmostEqual(float(weights.to(torch.float64).mean()), 1.0, places=7)
 
+    def test_loss_weight_amplification_expands_contrast_before_projection(self) -> None:
+        scores = torch.tensor(
+            [0.84, 0.86, 0.88, 0.90, 0.92, 0.95, 1.00, 1.05, 1.10, 1.15, 1.20, 1.25]
+        )
+        original = project_scores_to_bounded_mean_one(
+            scores,
+            min_weight=0.5,
+            max_weight=2.0,
+        )
+
+        amplified = project_scores_to_bounded_mean_one(
+            scores,
+            min_weight=0.5,
+            max_weight=2.0,
+            amplification=4.0,
+        )
+
+        amplified_range = amplified.max() - amplified.min()
+        original_range = original.max() - original.min()
+        self.assertGreater(float(amplified_range), 2.0 * float(original_range))
+        self.assertGreaterEqual(float(amplified.min()), 0.5)
+        self.assertLessEqual(float(amplified.max()), 2.0)
+        self.assertAlmostEqual(float(amplified.to(torch.float64).mean()), 1.0, places=7)
+        self.assertAlmostEqual(float(amplified.min()), 0.5)
+        self.assertGreater(float(amplified.max()), 1.9)
+
+    def test_explicit_unit_amplification_preserves_original_projection(self) -> None:
+        scores = torch.tensor([0.5, 1.0, 1.5, 2.0])
+
+        implicit = project_scores_to_bounded_mean_one(
+            scores,
+            min_weight=0.2,
+            max_weight=5.0,
+        )
+        explicit = project_scores_to_bounded_mean_one(
+            scores,
+            min_weight=0.2,
+            max_weight=5.0,
+            amplification=1.0,
+        )
+
+        torch.testing.assert_close(explicit, implicit)
+
     def test_exposure_is_counted_per_question_not_per_grpo_response(self) -> None:
         controller = self._controller(
             prior_strength=0.0,

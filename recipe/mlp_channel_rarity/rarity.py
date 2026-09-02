@@ -21,6 +21,7 @@ projected into a configured box while enforcing a global mean of exactly one.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Iterable
@@ -54,10 +55,12 @@ def project_scores_to_bounded_mean_one(
     *,
     min_weight: float,
     max_weight: float,
+    amplification: float = 1.0,
 ) -> torch.Tensor:
     """Project non-negative scores to a box while enforcing mean(weight) == 1.
 
-    Starting from ``scores / mean(scores)``, this computes the Euclidean
+    Starting from ``v = scores / mean(scores)``, first amplify deviations from
+    one as ``1 + amplification * (v - 1)``.  Then compute the Euclidean
     projection onto ``[min_weight, max_weight]`` intersected with the unit-mean
     hyperplane.  The solution has the form ``clip(v - lambda, low, high)``.
     """
@@ -65,6 +68,8 @@ def project_scores_to_bounded_mean_one(
         raise ValueError(f"scores must be a non-empty vector, got shape {tuple(scores.shape)}")
     if not 0.0 < min_weight <= 1.0 <= max_weight:
         raise ValueError("weight bounds must satisfy 0 < min_weight <= 1 <= max_weight")
+    if not math.isfinite(amplification) or amplification <= 0.0:
+        raise ValueError(f"amplification must be finite and positive, got {amplification}")
     if not bool(torch.isfinite(scores).all().item()) or bool((scores < 0).any().item()):
         return torch.ones_like(scores, dtype=torch.float32)
 
@@ -73,6 +78,7 @@ def project_scores_to_bounded_mean_one(
     if float(mean.item()) <= 0.0:
         return torch.ones_like(scores, dtype=torch.float32)
     values = values / mean
+    values = 1.0 + amplification * (values - 1.0)
 
     lower_shift = (values - max_weight).min()
     upper_shift = (values - min_weight).max()
@@ -131,6 +137,7 @@ class MLPChannelRarityController:
         use_frequency_prior: bool = False,
         min_loss_weight: float = 0.2,
         max_loss_weight: float = 5.0,
+        loss_weight_amplification: float = 1.0,
     ) -> None:
         if num_layers <= 0:
             raise ValueError(f"num_layers must be positive, got {num_layers}")
@@ -159,6 +166,11 @@ class MLPChannelRarityController:
         if not 0.0 < min_loss_weight <= 1.0 <= max_loss_weight:
             raise ValueError(
                 "loss-weight bounds must satisfy 0 < min_loss_weight <= 1 <= max_loss_weight"
+            )
+        if not math.isfinite(loss_weight_amplification) or loss_weight_amplification <= 0.0:
+            raise ValueError(
+                "loss_weight_amplification must be finite and positive, "
+                f"got {loss_weight_amplification}"
             )
 
         layers = (
@@ -199,6 +211,7 @@ class MLPChannelRarityController:
         self.use_frequency_prior = bool(use_frequency_prior)
         self.min_loss_weight = float(min_loss_weight)
         self.max_loss_weight = float(max_loss_weight)
+        self.loss_weight_amplification = float(loss_weight_amplification)
 
         shape = (len(self.selected_layers), self.intermediate_size)
         self.normal_activation = torch.zeros(shape, dtype=torch.float32)
@@ -465,6 +478,7 @@ class MLPChannelRarityController:
                     global_raw_scores,
                     min_weight=self.min_loss_weight,
                     max_weight=self.max_loss_weight,
+                    amplification=self.loss_weight_amplification,
                 )
                 loss_weights = global_loss_weights[
                     local_start : local_start + raw_scores.numel()
@@ -542,6 +556,7 @@ class MLPChannelRarityController:
                 "mlp_rarity/normal_activation_max": float(self.normal_activation.max().item()),
                 "mlp_rarity/selected_layers": float(len(self.selected_layers)),
                 "mlp_rarity/top_k": float(self.top_k),
+                "mlp_rarity/loss_weight_amplification": self.loss_weight_amplification,
                 **rarity_metrics,
             }
             return RarityStepResult(
@@ -563,6 +578,9 @@ class MLPChannelRarityController:
             "max_channel_rarity": self.max_channel_rarity,
             "responses_per_question": self.responses_per_question,
             "use_frequency_prior": self.use_frequency_prior,
+            "min_loss_weight": self.min_loss_weight,
+            "max_loss_weight": self.max_loss_weight,
+            "loss_weight_amplification": self.loss_weight_amplification,
             "normal_activation": self.normal_activation.detach().cpu(),
             "exposure_count": self.exposure_count.detach().cpu(),
             "exposure_questions": self.exposure_questions,
@@ -599,6 +617,18 @@ class MLPChannelRarityController:
         if bool(state["use_frequency_prior"]) != self.use_frequency_prior:
             raise ValueError(
                 "rarity checkpoint use_frequency_prior does not match the recipe config"
+            )
+        if float(state.get("min_loss_weight", 0.2)) != self.min_loss_weight:
+            raise ValueError(
+                "rarity checkpoint min_loss_weight does not match the recipe config"
+            )
+        if float(state.get("max_loss_weight", 5.0)) != self.max_loss_weight:
+            raise ValueError(
+                "rarity checkpoint max_loss_weight does not match the recipe config"
+            )
+        if float(state.get("loss_weight_amplification", 1.0)) != self.loss_weight_amplification:
+            raise ValueError(
+                "rarity checkpoint loss_weight_amplification does not match the recipe config"
             )
         normal = torch.as_tensor(state["normal_activation"], dtype=torch.float32)
         exposure = torch.as_tensor(state["exposure_count"], dtype=torch.float32)

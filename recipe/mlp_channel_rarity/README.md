@@ -48,7 +48,8 @@ raw_s_q = mean(rarity of selected channels)
 
 ```text
 v_q = raw_s_q / mean_q(raw_s_q)
-s_q = clip(v_q - lambda, 0.2, 5.0)
+amplified_v_q = 1 + alpha * (v_q - 1)
+s_q = clip(amplified_v_q - lambda, min_weight, max_weight)
 ```
 
 其中标量 `lambda` 通过二分求解，使 `sum_q(s_q) / B = 1`。这不是简单的“先
@@ -57,6 +58,10 @@ s_q = clip(v_q - lambda, 0.2, 5.0)
 并保持题目间的权重次序。所得 `s_q` 直接作为该问题所有 response 的 actor loss
 multiplier。第一步尚无历史 EMA，因此所有问题的 `s_q=1`；该步只初始化正常
 激活水平，不累计曝光。
+
+`alpha=loss_weight_amplification` 控制区分度，默认值 `1.0` 完全等价于原算法；
+`alpha>1` 以 1 为中心放大题目间差异，之后仍通过上述投影严格满足权重边界与
+全局均值 1。
 
 EMA 在计算本 step deviation 之后更新，避免当前问题进入自己的基线。累计曝光、
 EMA 和 step 计数保存在 actor checkpoint 的 `mlp_channel_rarity.pt` 中。
@@ -84,6 +89,14 @@ ${CKPTS_DIR}/rollout_data/question_rarity/<step>.jsonl
 bash recipe/mlp_channel_rarity/grpo_mlp_channel_rarity_qwen3-4b_offline.sh
 ```
 
+使用 10 倍区分度和 `[0.2, 5.0]` 权重边界：
+
+```bash
+bash recipe/mlp_channel_rarity/grpo_mlp_channel_rarity_qwen3-4b_amplified_offline.sh
+```
+
+这个 wrapper 使用独立的 experiment name，避免自动续训原始区分度的 run。
+
 常用覆盖参数：
 
 ```bash
@@ -92,6 +105,7 @@ topk_ratio=0.005 \
 use_frequency_prior=True \
 frequency_prior_strength=64 \
 max_channel_rarity=8 \
+loss_weight_amplification=1.0 \
 min_loss_weight=0.2 \
 max_loss_weight=5.0 \
 bash recipe/mlp_channel_rarity/grpo_mlp_channel_rarity_qwen3-4b_offline.sh
@@ -113,3 +127,4 @@ Ulysses SP=1，并关闭 old-log-prob 的 dynamic batching，保证激活权重�
 - `mlp_rarity/channel_rarity_max_observed`
 - `mlp_rarity/raw_score_mean`
 - `mlp_rarity/loss_weight_min/mean/max`
+- `mlp_rarity/loss_weight_amplification`

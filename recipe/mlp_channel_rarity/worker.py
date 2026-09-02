@@ -57,6 +57,7 @@ class MLPChannelRarityActorRolloutRefWorker(ActorRolloutRefWorker):
             use_frequency_prior=bool(config.get("use_frequency_prior", False)),
             min_loss_weight=float(config.get("min_loss_weight", 0.2)),
             max_loss_weight=float(config.get("max_loss_weight", 5.0)),
+            loss_weight_amplification=float(config.get("loss_weight_amplification", 1.0)),
         )
 
         actor_cfg = omega_conf_to_dataclass(self.config.actor)

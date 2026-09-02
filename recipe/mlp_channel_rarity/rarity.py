@@ -31,6 +31,17 @@ import torch.distributed as dist
 _LAYER_RE = re.compile(r"(?:^|\.)(?:layers|h)\.(\d+)\.mlp(?:\.|$)")
 
 
+def _layer_index(module_name: str) -> int | None:
+    """Resolve an HF layer index through transparent FSDP1 wrappers."""
+    # FSDP1 inserts this traversal-only module into each auto-wrapped decoder
+    # layer: ``model.layers.0._fsdp_wrapped_module.mlp``.
+    normalized_name = ".".join(
+        part for part in module_name.split(".") if part != "_fsdp_wrapped_module"
+    )
+    match = _LAYER_RE.search(normalized_name)
+    return int(match.group(1)) if match else None
+
+
 @dataclass(frozen=True)
 class RarityStepResult:
     raw_scores: torch.Tensor
@@ -644,10 +655,9 @@ def install_hf_mlp_activation_observer(
     installed: list[str] = []
     seen_layers: set[int] = set()
     for name, module in model.named_modules():
-        match = _LAYER_RE.search(name)
-        if match is None:
+        layer_idx = _layer_index(name)
+        if layer_idx is None:
             continue
-        layer_idx = int(match.group(1))
         if layer_idx not in controller.layer_to_slot or layer_idx in seen_layers:
             continue
         if not all(hasattr(module, attr) for attr in ("gate_proj", "up_proj", "down_proj", "act_fn")):

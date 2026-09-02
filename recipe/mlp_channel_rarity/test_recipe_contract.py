@@ -54,10 +54,11 @@ class MLPChannelRarityRecipeContractTest(unittest.TestCase):
         self.assertIn("loss_weights = torch.ones_like(raw_scores)", source)
         self.assertIn("self.normal_activation.copy_(batch_normal)", source)
 
-    def test_launcher_uses_recipe_and_molu_python(self) -> None:
+    def test_launcher_uses_recipe_and_configurable_python(self) -> None:
         launcher = (RECIPE_DIR / "grpo_mlp_channel_rarity_qwen3-4b_offline.sh").read_text()
         self.assertIn("recipe.mlp_channel_rarity.main", launcher)
-        self.assertIn("/opt/homebrew/Caskroom/miniconda/base/envs/molu/bin/python", launcher)
+        self.assertIn('python_bin=${python_bin:-python}', launcher)
+        self.assertIn('"${python_bin}" -m recipe.mlp_channel_rarity.main', launcher)
         self.assertIn("actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=False", launcher)
         self.assertIn("use_frequency_prior=${use_frequency_prior}", launcher)
 

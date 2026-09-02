@@ -33,6 +33,17 @@ class _Block(nn.Module):
         self.mlp = _DenseMLP(width)
 
 
+class _FSDPWrapper(nn.Module):
+    """Dependency-free stand-in for FSDP1's named-module hierarchy."""
+
+    def __init__(self, module: nn.Module) -> None:
+        super().__init__()
+        self._fsdp_wrapped_module = module
+
+    def forward(self, *args, **kwargs):
+        return self._fsdp_wrapped_module(*args, **kwargs)
+
+
 class _ToyModel(nn.Module):
     def __init__(self, layers: int, width: int) -> None:
         super().__init__()
@@ -211,6 +222,37 @@ class MLPChannelRarityControllerTest(unittest.TestCase):
         installed = install_hf_mlp_activation_observer(model, controller)
 
         self.assertEqual(installed, ["layers.1.mlp"])
+
+    def test_dense_mlp_is_found_inside_fsdp1_wrapped_decoder_layers(self) -> None:
+        controller = MLPChannelRarityController(
+            num_layers=2,
+            intermediate_size=4,
+            top_k=1,
+        )
+        model = _ToyModel(layers=2, width=4)
+        model.layers = nn.ModuleList([_FSDPWrapper(layer) for layer in model.layers])
+
+        installed = install_hf_mlp_activation_observer(model, controller)
+
+        self.assertEqual(
+            installed,
+            [
+                "layers.0._fsdp_wrapped_module.mlp",
+                "layers.1._fsdp_wrapped_module.mlp",
+            ],
+        )
+
+        controller.begin_step()
+        controller.begin_micro_batch(
+            prompt_mask=torch.ones((1, 1), dtype=torch.bool),
+            sample_ids=torch.zeros((1, 1), dtype=torch.long),
+            sample_count=1,
+        )
+        model.layers[0]._fsdp_wrapped_module.mlp(torch.ones((1, 1, 4)))
+        model.layers[1]._fsdp_wrapped_module.mlp(torch.ones((1, 1, 4)))
+        controller.end_micro_batch()
+        result = controller.finalize_step()
+        torch.testing.assert_close(result.loss_weights, torch.ones(1))
 
 
 if __name__ == "__main__":

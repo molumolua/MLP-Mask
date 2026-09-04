@@ -30,14 +30,26 @@ from verl.utils.seqlen_balancing import (
 )
 
 from .intervention import (
+    CAUSAL_ABLATION_SCORE,
     CLEAN_ROUTE,
+    GRADIENT_ACTIVATION_SCORE,
     GLOBAL_RANDOM_SCOPE,
     MASKED_ROUTE,
+    OUTPUT_CONTRIBUTION_SCORE,
     PER_LAYER_RANDOM_SCOPE,
     RANDOM_SELECTION,
+    RELATIVE_ACTIVATION_SCORE,
+    SOFT_TOP_SELECTION,
     TOP_RELATIVE_ACTIVATION_SELECTION,
     WEIGHTED_RANDOM_SELECTION,
 )
+
+_FORWARD_SCORE_METHODS = {
+    RELATIVE_ACTIVATION_SCORE,
+    OUTPUT_CONTRIBUTION_SCORE,
+    GRADIENT_ACTIVATION_SCORE,
+}
+_VALID_SCORE_METHODS = _FORWARD_SCORE_METHODS | {CAUSAL_ABLATION_SCORE}
 
 
 class MLPChannelMaskTrainer(RayPPOTrainer):
@@ -89,14 +101,34 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
         if refresh_freq != int(config.trainer.test_freq):
             raise ValueError("mlp_intervention.refresh_freq must equal trainer.test_freq in this recipe")
         selection_strategy = str(
-            intervention.get("selection_strategy", TOP_RELATIVE_ACTIVATION_SELECTION)
+            intervention.get("selection_strategy", SOFT_TOP_SELECTION)
         )
         if selection_strategy not in {
             TOP_RELATIVE_ACTIVATION_SELECTION,
             RANDOM_SELECTION,
             WEIGHTED_RANDOM_SELECTION,
+            SOFT_TOP_SELECTION,
         }:
             raise ValueError(f"unsupported mlp_intervention.selection_strategy={selection_strategy!r}")
+        score_method = str(intervention.get("score_method", RELATIVE_ACTIVATION_SCORE))
+        if score_method not in _VALID_SCORE_METHODS:
+            raise ValueError(f"unsupported mlp_intervention.score_method={score_method!r}")
+        if (
+            selection_strategy == TOP_RELATIVE_ACTIVATION_SELECTION
+            and score_method != RELATIVE_ACTIVATION_SCORE
+        ):
+            raise ValueError(
+                "selection_strategy=top_relative_activation requires "
+                "score_method=relative_activation"
+            )
+        if (
+            selection_strategy == WEIGHTED_RANDOM_SELECTION
+            and score_method != RELATIVE_ACTIVATION_SCORE
+        ):
+            raise ValueError(
+                "legacy selection_strategy=weighted_random requires "
+                "score_method=relative_activation; use soft_top for new scores"
+            )
         random_scope = str(intervention.get("random_scope", PER_LAYER_RANDOM_SCOPE))
         if random_scope not in {PER_LAYER_RANDOM_SCOPE, GLOBAL_RANDOM_SCOPE}:
             raise ValueError(f"unsupported mlp_intervention.random_scope={random_scope!r}")
@@ -106,10 +138,11 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
         if random_resample_every_step and selection_strategy not in {
             RANDOM_SELECTION,
             WEIGHTED_RANDOM_SELECTION,
+            SOFT_TOP_SELECTION,
         }:
             raise ValueError(
                 "mlp_intervention.random_resample_every_step=true requires "
-                "selection_strategy=random or weighted_random"
+                "selection_strategy=random, weighted_random, or soft_top"
             )
         activation_update_every_step = bool(
             intervention.get("activation_update_every_step", False)
@@ -117,10 +150,23 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
         if activation_update_every_step and selection_strategy not in {
             TOP_RELATIVE_ACTIVATION_SELECTION,
             WEIGHTED_RANDOM_SELECTION,
+            SOFT_TOP_SELECTION,
         }:
             raise ValueError(
                 "mlp_intervention.activation_update_every_step=true requires "
-                "selection_strategy=top_relative_activation or weighted_random"
+                "a score-based selection strategy"
+            )
+        if activation_update_every_step and score_method not in _FORWARD_SCORE_METHODS:
+            raise ValueError(
+                "mlp_intervention.activation_update_every_step=true requires a "
+                "forward/backward score method"
+            )
+        if score_method == CAUSAL_ABLATION_SCORE and (
+            selection_strategy != SOFT_TOP_SELECTION or not random_resample_every_step
+        ):
+            raise ValueError(
+                "score_method=causal_ablation requires selection_strategy=soft_top "
+                "and random_resample_every_step=true"
             )
 
     def _build_dual_route_batch(self, batch: DataProto, mask_version: int) -> DataProto:
@@ -163,6 +209,12 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
         metrics.update(result["metrics"])
         timing_raw.update(result["timings"])
         return int(result["mask_version"])
+
+    def _observe_causal_effect(self, reward_gap: float, metrics: dict) -> None:
+        outputs = self.actor_rollout_wg.observe_mlp_causal_effect(float(reward_gap))
+        if not outputs:
+            raise RuntimeError("MLP causal score update returned no worker result")
+        metrics.update(outputs[0])
 
     def _balance_dual_route_batch(self, batch: DataProto, metrics: dict) -> None:
         """Token-balance DP shards while preserving each route's per-rank quota."""
@@ -263,17 +315,21 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
         refresh_freq = int(intervention.get("refresh_freq", self.config.trainer.test_freq))
         warmup_steps = int(intervention.get("warmup_steps", 1))
         selection_strategy = str(
-            intervention.get("selection_strategy", TOP_RELATIVE_ACTIVATION_SELECTION)
+            intervention.get("selection_strategy", SOFT_TOP_SELECTION)
         )
         random_resample_every_step = bool(intervention.get("random_resample_every_step", False))
         activation_update_every_step = bool(
             intervention.get("activation_update_every_step", False)
         )
-        weighted_random = selection_strategy == WEIGHTED_RANDOM_SELECTION
-        # A weighted refresh performed after a checkpointed step prepares the mask
+        score_method = str(intervention.get("score_method", RELATIVE_ACTIVATION_SCORE))
+        soft_top = selection_strategy in {
+            SOFT_TOP_SELECTION,
+            WEIGHTED_RANDOM_SELECTION,
+        }
+        # A soft-top refresh performed after a checkpointed step prepares the mask
         # for the next step.  On resume, version==next global step preserves it.
         mask_prepared_for_current_step = (
-            weighted_random
+            soft_top
             and random_resample_every_step
             and mask_version == self.global_steps
         )
@@ -284,6 +340,9 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
                 timing_raw: dict[str, float] = {}
                 metrics["mlp_mask/random_resample_every_step"] = float(random_resample_every_step)
                 metrics["mlp_activation/update_every_step"] = float(
+                    activation_update_every_step
+                )
+                metrics["mlp_score/update_every_step"] = float(
                     activation_update_every_step
                 )
                 with marked_timer("start_profile", timing_raw):
@@ -324,7 +383,8 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
                 collect_mlp_activation = activation_update_due and selection_strategy in {
                     TOP_RELATIVE_ACTIVATION_SELECTION,
                     WEIGHTED_RANDOM_SELECTION,
-                }
+                    SOFT_TOP_SELECTION,
+                } and score_method in _FORWARD_SCORE_METHODS
                 # With every-step updates, step t's clean backward prepares the
                 # relative-activation mask for step t+1.  Otherwise hooks are only
                 # installed on the periodic refresh step.
@@ -411,6 +471,17 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
                             config=self.config.algorithm,
                         )
                         metrics.update(compute_route_metrics(batch))
+                        causal_score_observed = False
+                        if score_method == CAUSAL_ABLATION_SCORE:
+                            reward_gap = metrics.get(
+                                "route/reward_gap_clean_minus_masked"
+                            )
+                            if reward_gap is None:
+                                raise RuntimeError(
+                                    "causal score requires the clean-minus-masked reward gap"
+                                )
+                            self._observe_causal_effect(reward_gap, metrics)
+                            causal_score_observed = True
 
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         with marked_timer("update_actor_dual", timing_raw, color="red"):
@@ -449,6 +520,9 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
                 metrics["mlp_activation/collection_enabled"] = float(
                     collect_mlp_activation
                 )
+                metrics["mlp_score/collection_enabled"] = float(
+                    collect_mlp_activation
+                )
                 if should_refresh:
                     # Clean validation (when scheduled) intentionally happens before
                     # the new mask is selected; the refreshed mask starts next step.
@@ -459,10 +533,14 @@ class MLPChannelMaskTrainer(RayPPOTrainer):
                             for key, value in metrics.items()
                             if key.startswith("mlp_mask/") and key != "mlp_mask/rollout_version_used"
                         }
-                elif weighted_random and random_resample_every_step and collect_mlp_activation:
-                    # Consume the newly collected relative activation before checkpointing and
-                    # prepare the weighted mask for the next step.  The next loop
-                    # must reuse it instead of sampling twice.
+                elif (
+                    soft_top
+                    and random_resample_every_step
+                    and (collect_mlp_activation or causal_score_observed)
+                ):
+                    # Consume the newly collected score before checkpointing and
+                    # prepare the soft-top mask for the next step.  The next loop
+                    # reuses it instead of sampling twice.
                     with marked_timer("mlp_mask_refresh_driver", timing_raw, color="cyan"):
                         mask_version = self._refresh_mask(metrics, timing_raw)
                     current_mask_metrics = {

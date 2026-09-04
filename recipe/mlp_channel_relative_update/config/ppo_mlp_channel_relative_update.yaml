@@ -1,0 +1,65 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+actor_rollout_ref:
+  mlp_channel_relative_update:
+    enabled: true
+    # null updates every transformer block; a fixed layer list is also accepted.
+    layers: null
+    # EMA of the squared actual relative parameter update.
+    history_ema_beta: 0.99
+    # Exponent on inverse historical relative-update RMS.
+    history_power: 0.5
+    # Stabilizer expressed as a fraction of each layer's median history.
+    history_floor_ratio: 0.1
+    # The largest permitted ratio between any two channel multipliers.
+    # Bounds are symmetric in log space: [1/sqrt(cap), sqrt(cap)].
+    multiplier_ratio_cap: 10.0
+    # Collect ordinary AdamW history before enabling redistribution.
+    warmup_steps: 16
+    parameter_rms_epsilon: 1.0e-12
+    history_epsilon: 1.0e-12
+
+  actor:
+    strategy: fsdp2
+    force_on_policy: true
+    use_rollout_log_probs: true
+    ppo_epochs: 1
+    ulysses_sequence_parallel_size: 1
+    optim:
+      optimizer_impl: recipe.mlp_channel_relative_update.optimizer
+      optimizer: ChannelRelativeUpdateAdamW
+    fsdp_config:
+      param_offload: false
+      optimizer_offload: false
+      offload_policy: false
+
+  rollout:
+    name: vllm
+    mode: sync
+    n: 16
+    calculate_log_probs: true
+    # Kept equal to the rarity experiment to make comparisons straightforward.
+    log_prob_use_dynamic_bsz: false
+    log_prob_micro_batch_size_per_gpu: 1
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  rollout_correction:
+    bypass_old_logprob_for_rollout: false
+    rollout_is: null
+    rollout_rs: null
+
+reward_model:
+  reward_manager: naive
+
+trainer:
+  project_name: MLP-Channel-Relative-Update
+  merge_duplicate_val_prompts: true
+  validation_pass_reward_threshold: 0.0

@@ -1,4 +1,4 @@
-"""MLP-channel masks selected by clean-policy relative activation.
+"""MLP-channel masks selected by configurable clean-policy scores.
 
 The controller deliberately keeps masks outside the model state dict.  vLLM active
 buffers are registered on their MLP modules before compilation/CUDA-graph capture;
@@ -6,13 +6,15 @@ other backends may allocate them lazily.  Route switches update each available b
 in place (or defer the update while vLLM sleeps), so a captured graph keeps the same
 pointer and reads new clean/masked values without recapture.
 
-For every layer and channel, the controller measures the per-response RMS activation,
-averages it across clean samples, and compares it with an EMA baseline from previous
-steps.  The largest positive relative deviations are masked before the EMA is updated.
+The preferred selector is soft-top sampling: score percentile ranks are converted to
+bounded positive weights and an exact per-layer quota is sampled without replacement.
+The controller supports relative RMS activation, scale-aware output contribution,
+gradient x activation, and an online randomized grouped-ablation estimate.
 """
 
 from __future__ import annotations
 
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -28,16 +30,34 @@ _VALID_ROUTES = {CLEAN_ROUTE, MASKED_ROUTE}
 TOP_RELATIVE_ACTIVATION_SELECTION = "top_relative_activation"
 RANDOM_SELECTION = "random"
 WEIGHTED_RANDOM_SELECTION = "weighted_random"
+SOFT_TOP_SELECTION = "soft_top"
 _VALID_SELECTION_STRATEGIES = {
     TOP_RELATIVE_ACTIVATION_SELECTION,
     RANDOM_SELECTION,
     WEIGHTED_RANDOM_SELECTION,
+    SOFT_TOP_SELECTION,
+}
+RELATIVE_ACTIVATION_SCORE = "relative_activation"
+OUTPUT_CONTRIBUTION_SCORE = "output_contribution"
+GRADIENT_ACTIVATION_SCORE = "gradient_activation"
+CAUSAL_ABLATION_SCORE = "causal_ablation"
+_VALID_SCORE_METHODS = {
+    RELATIVE_ACTIVATION_SCORE,
+    OUTPUT_CONTRIBUTION_SCORE,
+    GRADIENT_ACTIVATION_SCORE,
+    CAUSAL_ABLATION_SCORE,
+}
+_FORWARD_SCORE_METHODS = {
+    RELATIVE_ACTIVATION_SCORE,
+    OUTPUT_CONTRIBUTION_SCORE,
+    GRADIENT_ACTIVATION_SCORE,
 }
 PER_LAYER_RANDOM_SCOPE = "per_layer"
 GLOBAL_RANDOM_SCOPE = "global"
 _VALID_RANDOM_SCOPES = {PER_LAYER_RANDOM_SCOPE, GLOBAL_RANDOM_SCOPE}
 _LAYER_RE = re.compile(r"(?:^|\.)(?:layers|h)\.(\d+)\.mlp(?:\.|$)")
-_ACTIVATION_SCORE_TYPE = "relative_activation_rms_v1"
+_LEGACY_ACTIVATION_SCORE_TYPE = "relative_activation_rms_v1"
+_CHECKPOINT_FORMAT = "mlp_channel_soft_top_scores_v2"
 
 
 @dataclass(frozen=True)
@@ -47,11 +67,11 @@ class MaskRefreshResult:
 
 
 class MLPChannelInterventionController:
-    """Own per-block masks, relative-activation statistics, and mask history.
+    """Own per-block masks, channel scores, and mask history.
 
     ``keep_mask[layer, channel]`` is True for an available channel and False for a
-    channel removed by the structured intervention.  Masks are selected either by
-    clean relative activation or reproducible per-layer/global random sampling.
+    channel removed by the structured intervention.  The score definition is
+    independent from the selection rule so all score variants can share soft-top.
     """
 
     def __init__(
@@ -63,6 +83,8 @@ class MLPChannelInterventionController:
         activation_ema_beta: float = 0.95,
         relative_activation_epsilon: float = 1e-6,
         selection_strategy: str = TOP_RELATIVE_ACTIVATION_SELECTION,
+        score_method: str = RELATIVE_ACTIVATION_SCORE,
+        score_ema_beta: float = 0.0,
         random_seed: int = 42,
         random_scope: str = PER_LAYER_RANDOM_SCOPE,
         weighted_max_ratio: float = 4.0,
@@ -91,6 +113,27 @@ class MLPChannelInterventionController:
                 f"selection_strategy must be one of {sorted(_VALID_SELECTION_STRATEGIES)}, "
                 f"got {selection_strategy!r}"
             )
+        if score_method not in _VALID_SCORE_METHODS:
+            raise ValueError(
+                f"score_method must be one of {sorted(_VALID_SCORE_METHODS)}, got {score_method!r}"
+            )
+        if not 0.0 <= score_ema_beta < 1.0:
+            raise ValueError(f"score_ema_beta must be in [0, 1), got {score_ema_beta}")
+        if (
+            selection_strategy == TOP_RELATIVE_ACTIVATION_SELECTION
+            and score_method != RELATIVE_ACTIVATION_SCORE
+        ):
+            raise ValueError("top_relative_activation requires score_method=relative_activation")
+        if selection_strategy == WEIGHTED_RANDOM_SELECTION and score_method != RELATIVE_ACTIVATION_SCORE:
+            raise ValueError(
+                "legacy weighted_random requires score_method=relative_activation; "
+                "use selection_strategy=soft_top for other scores"
+            )
+        if (
+            score_method == CAUSAL_ABLATION_SCORE
+            and selection_strategy != SOFT_TOP_SELECTION
+        ):
+            raise ValueError("causal_ablation requires selection_strategy=soft_top")
         if random_seed < 0:
             raise ValueError(f"random_seed must be non-negative, got {random_seed}")
         if random_scope not in _VALID_RANDOM_SCOPES:
@@ -116,6 +159,8 @@ class MLPChannelInterventionController:
         self.activation_ema_beta = float(activation_ema_beta)
         self.relative_activation_epsilon = float(relative_activation_epsilon)
         self.selection_strategy = str(selection_strategy)
+        self.score_method = str(score_method)
+        self.score_ema_beta = float(score_ema_beta)
         self.random_seed = int(random_seed)
         self.random_scope = str(random_scope)
         self.weighted_max_ratio = float(weighted_max_ratio)
@@ -130,8 +175,17 @@ class MLPChannelInterventionController:
             (self.num_layers, self.intermediate_size), dtype=torch.float32
         )
         self.relative_activation_score = torch.zeros_like(self.activation_ema)
+        self.selection_score = torch.zeros_like(self.activation_ema)
         self.activation_ema_initialized = False
         self.relative_activation_initialized = False
+        self.selection_score_initialized = False
+        self.causal_reward_gap_ema = 0.0
+        self.causal_reward_gap_initialized = False
+        self.causal_observations = 0
+        self._last_causal_reward_gap = 0.0
+        self._last_causal_residual = 0.0
+        self.causal_assignment_contrast = torch.zeros_like(self.activation_ema)
+        self.causal_assignment_contrast_initialized = False
         self.mask_version = 0
         self.cumulative_mask_assignments = 0
 
@@ -141,6 +195,7 @@ class MLPChannelInterventionController:
         self._response_sample_ids: torch.Tensor | None = None
         self._response_sample_count = 0
         self._activation_level_sum: dict[int, torch.Tensor] = {}
+        self._gradient_activation_sum: dict[int, torch.Tensor] = {}
         self._activation_sample_count: torch.Tensor | None = None
         self._activation_token_count: torch.Tensor | None = None
         self._activation_accumulate_cpu_s = 0.0
@@ -164,12 +219,9 @@ class MLPChannelInterventionController:
             raise ValueError(f"route must be one of {_VALID_ROUTES}, got {route!r}")
         if collect_activation and route != CLEAN_ROUTE:
             raise ValueError("activation may only be collected on the clean route")
-        if collect_activation and self.selection_strategy not in {
-            TOP_RELATIVE_ACTIVATION_SELECTION,
-            WEIGHTED_RANDOM_SELECTION,
-        }:
+        if collect_activation and self.score_method not in _FORWARD_SCORE_METHODS:
             raise ValueError(
-                "activation collection requires top_relative_activation or weighted_random selection"
+                f"score_method={self.score_method!r} does not use actor activation collection"
             )
         self.route = route
         self.collect_activation = bool(collect_activation)
@@ -223,8 +275,14 @@ class MLPChannelInterventionController:
         self._response_sample_ids = None
         self._response_sample_count = 0
 
-    def apply(self, layer_idx: int, activation: torch.Tensor) -> torch.Tensor:
-        """Apply the route and optionally collect clean response activation RMS."""
+    def apply(
+        self,
+        layer_idx: int,
+        activation: torch.Tensor,
+        *,
+        down_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply the route and optionally collect the configured clean score."""
         if not 0 <= layer_idx < self.num_layers:
             raise IndexError(f"layer {layer_idx} outside [0, {self.num_layers})")
         if activation.shape[-1] not in {
@@ -242,26 +300,53 @@ class MLPChannelInterventionController:
             token_mask = self._response_token_mask
             sample_ids = self._response_sample_ids
             sample_count = self._response_sample_count
-            # The backward hook is only a once-per-forward lifecycle trigger.  The
-            # score uses activation alone; the gradient value is intentionally ignored.
-            # This avoids double-counting gradient-checkpoint recomputation.
+            down_norm = None
+            if self.score_method == OUTPUT_CONTRIBUTION_SCORE:
+                if down_weight is None or down_weight.ndim != 2:
+                    raise RuntimeError(
+                        "output_contribution scoring requires the 2-D down_proj weight"
+                    )
+                weight_for_norm = down_weight.detach()
+                placements = getattr(weight_for_norm, "placements", ())
+                if placements:
+                    if any(
+                        type(placement).__name__ != "Replicate"
+                        for placement in placements
+                    ):
+                        raise RuntimeError(
+                            "output_contribution requires down_proj to be unsharded "
+                            "during forward"
+                        )
+                    weight_for_norm = weight_for_norm.to_local()
+                down_norm = (
+                    weight_for_norm.to(dtype=torch.float32).square().sum(dim=0).sqrt()
+                )
+                if down_norm.numel() != activation.shape[-1]:
+                    raise RuntimeError(
+                        "down_proj input width does not match the observed MLP activation"
+                    )
+            # Waiting for backward avoids counting the checkpointed no-grad forward.
+            # gradient_activation consumes the hook gradient; the two forward-only
+            # scores use the hook solely as a once-per-training-forward trigger.
             activation.register_hook(
-                lambda _grad, a=activation.detach(), m=token_mask, ids=sample_ids, count=sample_count,
-                layer=layer_idx: self._accumulate_activation(
-                    layer, a, m, ids, count
+                lambda grad, a=activation.detach(), m=token_mask, ids=sample_ids,
+                count=sample_count, layer=layer_idx, dn=down_norm: self._accumulate_score(
+                    layer, a, grad, m, ids, count, dn
                 )
             )
 
         active_mask = self._get_active_buffer(layer_idx, activation)
         return activation * active_mask
 
-    def _accumulate_activation(
+    def _accumulate_score(
         self,
         layer_idx: int,
         activation: torch.Tensor,
+        grad: torch.Tensor,
         token_mask: torch.Tensor,
         sample_ids: torch.Tensor,
         sample_count: int,
+        down_weight_norm: torch.Tensor | None,
     ) -> None:
         accumulate_started = time.perf_counter()
         with torch.no_grad():
@@ -289,14 +374,7 @@ class MLPChannelInterventionController:
             ):
                 raise RuntimeError("response sample IDs are outside the current micro-batch")
 
-            squared_sum = torch.zeros(
-                (sample_count, activation.shape[-1]),
-                device=activation.device,
-                dtype=torch.float32,
-            )
             valid_activation = valid_activation.to(dtype=torch.float32)
-            valid_activation.square_()
-            squared_sum.index_add_(0, valid_sample_ids, valid_activation)
             token_count = torch.bincount(
                 valid_sample_ids,
                 minlength=sample_count,
@@ -304,26 +382,59 @@ class MLPChannelInterventionController:
             if bool((token_count == 0).any().item()):
                 missing = torch.nonzero(token_count == 0).flatten().tolist()
                 raise RuntimeError(f"clean samples without response tokens: {missing}")
-            activation_level_sum = torch.sqrt(
-                squared_sum / token_count.unsqueeze(-1).clamp_min(1.0)
-            ).sum(dim=0)
+
+            if self.score_method == GRADIENT_ACTIVATION_SCORE:
+                flat_grad = grad.detach().reshape(-1, grad.shape[-1])
+                valid_grad = flat_grad[flat_mask].to(dtype=torch.float32)
+                per_sample_sum = torch.zeros(
+                    (sample_count, activation.shape[-1]),
+                    device=activation.device,
+                    dtype=torch.float32,
+                )
+                per_sample_sum.index_add_(
+                    0,
+                    valid_sample_ids,
+                    (valid_activation * valid_grad).abs(),
+                )
+                score_level_sum = (
+                    per_sample_sum / token_count.unsqueeze(-1).clamp_min(1.0)
+                ).sum(dim=0)
+            else:
+                squared_sum = torch.zeros(
+                    (sample_count, activation.shape[-1]),
+                    device=activation.device,
+                    dtype=torch.float32,
+                )
+                squared_sum.index_add_(0, valid_sample_ids, valid_activation.square())
+                score_level_sum = torch.sqrt(
+                    squared_sum / token_count.unsqueeze(-1).clamp_min(1.0)
+                ).sum(dim=0)
+                if self.score_method == OUTPUT_CONTRIBUTION_SCORE:
+                    if down_weight_norm is None:
+                        raise RuntimeError("output contribution score is missing down_proj norms")
+                    score_level_sum.mul_(down_weight_norm.to(device=score_level_sum.device))
 
             # Actor/HF activations are expected to be full-width.  Supporting a local
             # width here also makes the controller testable and future-proofs TP actors.
-            if activation_level_sum.numel() != self.intermediate_size:
+            if score_level_sum.numel() != self.intermediate_size:
                 full_sum = torch.zeros(
                     self.intermediate_size,
-                    device=activation_level_sum.device,
+                    device=score_level_sum.device,
                     dtype=torch.float32,
                 )
-                start, stop = self._local_slice(activation_level_sum.numel())
-                full_sum[start:stop] = activation_level_sum
-                activation_level_sum = full_sum
-            accumulator = self._activation_level_sum.get(layer_idx)
-            if accumulator is None or accumulator.device != activation_level_sum.device:
-                accumulator = torch.zeros_like(activation_level_sum)
-                self._activation_level_sum[layer_idx] = accumulator
-            accumulator.add_(activation_level_sum)
+                start, stop = self._local_slice(score_level_sum.numel())
+                full_sum[start:stop] = score_level_sum
+                score_level_sum = full_sum
+            target = (
+                self._gradient_activation_sum
+                if self.score_method == GRADIENT_ACTIVATION_SCORE
+                else self._activation_level_sum
+            )
+            accumulator = target.get(layer_idx)
+            if accumulator is None or accumulator.device != score_level_sum.device:
+                accumulator = torch.zeros_like(score_level_sum)
+                target[layer_idx] = accumulator
+            accumulator.add_(score_level_sum)
         # This is host dispatch time; GPU work remains included in update_actor.
         self._activation_accumulate_cpu_s += time.perf_counter() - accumulate_started
 
@@ -400,27 +511,121 @@ class MLPChannelInterventionController:
         for key, buffer in self._active_buffers.items():
             self._copy_route_to_buffer(key[0], buffer)
 
+    @property
+    def uses_soft_top(self) -> bool:
+        return self.selection_strategy in {SOFT_TOP_SELECTION, WEIGHTED_RANDOM_SELECTION}
+
+    @property
+    def needs_forward_score(self) -> bool:
+        return self.score_method in _FORWARD_SCORE_METHODS
+
+    def _update_selection_score(self, current: torch.Tensor) -> None:
+        current = current.detach().to(device="cpu", dtype=torch.float32)
+        if tuple(current.shape) != tuple(self.selection_score.shape):
+            raise ValueError(
+                f"selection score shape {tuple(current.shape)} != {tuple(self.selection_score.shape)}"
+            )
+        if self.selection_score_initialized:
+            self.selection_score.mul_(self.score_ema_beta).add_(
+                current,
+                alpha=1.0 - self.score_ema_beta,
+            )
+        else:
+            self.selection_score.copy_(current)
+            self.selection_score_initialized = True
+
+    @staticmethod
+    def _sampling_score_contrast(
+        weights: torch.Tensor, selected_in_order: torch.Tensor
+    ) -> torch.Tensor:
+        """Derivative of an ordered weighted-without-replacement log probability.
+
+        ``torch.multinomial(..., replacement=False)`` induces sequential sampling
+        probabilities proportional to each remaining weight.  This derivative has
+        expectation zero under that exact assignment policy, including after soft-top
+        weights become nonuniform.
+        """
+        weights = weights.to(device="cpu", dtype=torch.float32)
+        selected_in_order = selected_in_order.to(device="cpu", dtype=torch.long)
+        selected_weights = weights[selected_in_order]
+        removed_before = torch.cat(
+            [torch.zeros(1), selected_weights.cumsum(dim=0)[:-1]]
+        )
+        remaining_totals = weights.sum() - removed_before
+        inverse_total_prefix = remaining_totals.reciprocal().cumsum(dim=0)
+        contrast = -weights * inverse_total_prefix[-1]
+        contrast[selected_in_order] = (
+            1.0 - selected_weights * inverse_total_prefix
+        )
+        return contrast
+
+    def observe_causal_ablation(self, reward_gap_clean_minus_masked: float) -> dict[str, float]:
+        """Update an online randomized grouped-ablation score.
+
+        The dual rollout supplies one scalar outcome for the complete structured
+        mask.  Its reward-gap residual multiplies the score-function contrast of the
+        exact weighted-without-replacement assignment.  This estimates which changes
+        in channel masking probability increase the realized clean-minus-masked gap;
+        it is not an exact single-channel ablation.
+        """
+        if self.score_method != CAUSAL_ABLATION_SCORE:
+            raise RuntimeError(
+                "causal ablation observations require score_method=causal_ablation"
+            )
+        effect = float(reward_gap_clean_minus_masked)
+        if not math.isfinite(effect):
+            raise ValueError(f"causal reward gap must be finite, got {effect}")
+
+        self._last_causal_reward_gap = effect
+        residual = 0.0
+        score_updated = False
+        if (
+            self.causal_reward_gap_initialized
+            and self.causal_assignment_contrast_initialized
+        ):
+            residual = effect - self.causal_reward_gap_ema
+            evidence = residual * self.causal_assignment_contrast
+            self._update_selection_score(evidence)
+            score_updated = True
+
+        if self.causal_reward_gap_initialized:
+            self.causal_reward_gap_ema = (
+                self.score_ema_beta * self.causal_reward_gap_ema
+                + (1.0 - self.score_ema_beta) * effect
+            )
+        else:
+            self.causal_reward_gap_ema = effect
+            self.causal_reward_gap_initialized = True
+        self.causal_observations += 1
+        self._last_causal_residual = residual
+        return {
+            "mlp_causal/group_reward_gap": effect,
+            "mlp_causal/group_reward_gap_ema": self.causal_reward_gap_ema,
+            "mlp_causal/group_reward_gap_residual": residual,
+            "mlp_causal/observations": float(self.causal_observations),
+            "mlp_causal/score_updated": float(score_updated),
+        }
+
     def refresh_mask(self) -> MaskRefreshResult:
-        """Select a per-block mask from relative activation or seeded randomness."""
+        """Update the configured score, then select the next structured mask."""
         refresh_started = time.perf_counter()
         reduce_elapsed = 0.0
-        activation_metrics: dict[str, float] = {}
-        uses_activation = self.selection_strategy in {
-            TOP_RELATIVE_ACTIVATION_SELECTION,
-            WEIGHTED_RANDOM_SELECTION,
-        }
-        has_pending_activation = (
-            self._activation_sample_count is not None or bool(self._activation_level_sum)
+        score_metrics: dict[str, float] = {}
+        source_parts = (
+            self._gradient_activation_sum
+            if self.score_method == GRADIENT_ACTIVATION_SCORE
+            else self._activation_level_sum
         )
+        has_pending_score = self._activation_sample_count is not None or bool(source_parts)
         batch_activation_cpu: torch.Tensor | None = None
-        if uses_activation and (
+        if self.needs_forward_score and (
             self.selection_strategy == TOP_RELATIVE_ACTIVATION_SELECTION
-            or has_pending_activation
+            or has_pending_score
         ):
             device = self._score_device()
-            activation_level_sum = torch.stack(
+            score_level_sum = torch.stack(
                 [
-                    self._activation_level_sum.get(
+                    source_parts.get(
                         layer_idx,
                         torch.zeros(self.intermediate_size, device=device, dtype=torch.float32),
                     ).to(device)
@@ -441,6 +646,8 @@ class MLPChannelInterventionController:
             observed_layers = torch.tensor(
                 [
                     float(layer_idx in self._activation_level_sum)
+                    if self.score_method != GRADIENT_ACTIVATION_SCORE
+                    else float(layer_idx in self._gradient_activation_sum)
                     for layer_idx in range(self.num_layers)
                 ],
                 device=device,
@@ -449,7 +656,7 @@ class MLPChannelInterventionController:
 
             reduce_started = time.perf_counter()
             if dist.is_available() and dist.is_initialized():
-                dist.all_reduce(activation_level_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(score_level_sum, op=dist.ReduceOp.SUM)
                 dist.all_reduce(sample_count, op=dist.ReduceOp.SUM)
                 dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
                 dist.all_reduce(observed_layers, op=dist.ReduceOp.SUM)
@@ -463,41 +670,51 @@ class MLPChannelInterventionController:
                 raise RuntimeError(
                     f"cannot refresh MLP mask: no activation hook fired for layers {missing}"
                 )
-            batch_activation_cpu = (
-                activation_level_sum / sample_count.clamp_min(1.0)
-            ).cpu()
-            baseline_was_initialized = self.activation_ema_initialized
-            if baseline_was_initialized:
-                denominator = self.activation_ema.clamp_min(
-                    self.relative_activation_epsilon
-                )
-                self.relative_activation_score.copy_(
-                    (batch_activation_cpu - self.activation_ema) / denominator
-                )
-                self.relative_activation_initialized = True
+            batch_score_cpu = (score_level_sum / sample_count.clamp_min(1.0)).cpu()
+            if self.score_method == RELATIVE_ACTIVATION_SCORE:
+                batch_activation_cpu = batch_score_cpu
+                baseline_was_initialized = self.activation_ema_initialized
+                if baseline_was_initialized:
+                    denominator = self.activation_ema.clamp_min(
+                        self.relative_activation_epsilon
+                    )
+                    self.relative_activation_score.copy_(
+                        (batch_activation_cpu - self.activation_ema) / denominator
+                    )
+                    self.relative_activation_initialized = True
+                    self._update_selection_score(self.relative_activation_score)
+                else:
+                    self.relative_activation_score.zero_()
             else:
-                self.relative_activation_score.zero_()
-            activation_metrics = {
-                "mlp_activation/current_rms_mean": float(batch_activation_cpu.mean().item()),
-                "mlp_activation/current_rms_max": float(batch_activation_cpu.max().item()),
-                "mlp_activation/current_rms_min": float(batch_activation_cpu.min().item()),
+                baseline_was_initialized = self.selection_score_initialized
+                self._update_selection_score(batch_score_cpu)
+            score_metrics = {
+                "mlp_score/current_mean": float(batch_score_cpu.mean().item()),
+                "mlp_score/current_max": float(batch_score_cpu.max().item()),
+                "mlp_score/current_min": float(batch_score_cpu.min().item()),
                 "mlp_activation/response_samples": float(sample_count.item()),
                 "mlp_activation/response_tokens": float(token_count.item()),
                 "mlp_activation/layers_observed": float((observed_layers > 0).sum().item()),
-                "mlp_activation/updated_on_refresh": 1.0,
-                "mlp_activation/baseline_initialized_before_refresh": float(
+                "mlp_score/updated_on_refresh": 1.0,
+                "mlp_score/initialized_before_refresh": float(
                     baseline_was_initialized
                 ),
             }
-        elif self.selection_strategy == WEIGHTED_RANDOM_SELECTION:
-            activation_metrics = {
+            if self.score_method == RELATIVE_ACTIVATION_SCORE:
+                score_metrics.update(
+                    {
+                        "mlp_activation/current_rms_mean": float(batch_score_cpu.mean().item()),
+                        "mlp_activation/current_rms_max": float(batch_score_cpu.max().item()),
+                        "mlp_activation/current_rms_min": float(batch_score_cpu.min().item()),
+                    }
+                )
+        elif self.uses_soft_top and self.needs_forward_score:
+            score_metrics = {
                 "mlp_activation/response_samples": 0.0,
                 "mlp_activation/response_tokens": 0.0,
                 "mlp_activation/layers_observed": 0.0,
-                "mlp_activation/updated_on_refresh": 0.0,
-                "mlp_activation/baseline_initialized_before_refresh": float(
-                    self.activation_ema_initialized
-                ),
+                "mlp_score/updated_on_refresh": 0.0,
+                "mlp_score/initialized_before_refresh": float(self.selection_score_initialized),
             }
 
         select_started = time.perf_counter()
@@ -506,6 +723,7 @@ class MLPChannelInterventionController:
         old_masked = ~self.keep_mask
         new_keep = torch.ones_like(self.keep_mask)
         weighted_selected_ranks: list[torch.Tensor] = []
+        causal_contrasts: list[torch.Tensor] = []
         if self.selection_strategy == TOP_RELATIVE_ACTIVATION_SELECTION:
             # The first observation only establishes the normal-activation EMA.
             # Masking begins once a later batch can be compared with that baseline.
@@ -518,14 +736,17 @@ class MLPChannelInterventionController:
                         sorted=False,
                     ).indices
                     new_keep[layer_idx, top_idx] = False
-        elif self.selection_strategy == WEIGHTED_RANDOM_SELECTION:
+        elif self.uses_soft_top:
             generator = torch.Generator(device="cpu")
             generator.manual_seed(self.random_seed + self.mask_version)
             for layer_idx in range(self.num_layers):
-                if not self.relative_activation_initialized:
-                    selected = torch.randperm(self.intermediate_size, generator=generator)[:masked_per_layer]
+                if not self.selection_score_initialized:
+                    weights = torch.ones(self.intermediate_size, dtype=torch.float32)
+                    selected = torch.randperm(
+                        self.intermediate_size, generator=generator
+                    )[:masked_per_layer]
                 else:
-                    order = torch.argsort(self.relative_activation_score[layer_idx])
+                    order = torch.argsort(self.selection_score[layer_idx])
                     rank = torch.empty(self.intermediate_size, dtype=torch.float32)
                     rank[order] = torch.arange(self.intermediate_size, dtype=torch.float32)
                     rank.div_(max(self.intermediate_size - 1, 1))
@@ -539,6 +760,10 @@ class MLPChannelInterventionController:
                         generator=generator,
                     )
                     weighted_selected_ranks.append(rank[selected])
+                if self.score_method == CAUSAL_ABLATION_SCORE:
+                    causal_contrasts.append(
+                        self._sampling_score_contrast(weights, selected)
+                    )
                 new_keep[layer_idx, selected] = False
         elif self.random_scope == PER_LAYER_RANDOM_SCOPE:
             # Every actor worker reaches refresh with the same mask version.  A CPU
@@ -564,6 +789,9 @@ class MLPChannelInterventionController:
         new_unique = int((new_masked & ~self.ever_masked).sum().item())
 
         self.keep_mask.copy_(new_keep)
+        if causal_contrasts:
+            self.causal_assignment_contrast.copy_(torch.stack(causal_contrasts))
+            self.causal_assignment_contrast_initialized = True
         self.ever_masked.logical_or_(new_masked)
         self.mask_version += 1
         self.cumulative_mask_assignments += current
@@ -583,6 +811,7 @@ class MLPChannelInterventionController:
                 self.activation_ema_initialized = True
 
         self._activation_level_sum.clear()
+        self._gradient_activation_sum.clear()
         self._activation_sample_count = None
         self._activation_token_count = None
 
@@ -604,13 +833,18 @@ class MLPChannelInterventionController:
                     "mlp_mask/weighted_selected_top_1pct_fraction": float(
                         (selected_ranks >= 0.99).to(dtype=torch.float32).mean().item()
                     ),
-                    "mlp_mask/weighted_used_relative_activation": 1.0,
+                    "mlp_mask/soft_top_used_score": 1.0,
                 }
             )
-        elif self.selection_strategy == WEIGHTED_RANDOM_SELECTION:
-            metrics["mlp_mask/weighted_used_relative_activation"] = 0.0
-        metrics.update(activation_metrics)
-        if uses_activation:
+        elif self.uses_soft_top:
+            metrics["mlp_mask/soft_top_used_score"] = 0.0
+        # Retain the legacy metric for dashboards that compare old runs.
+        if self.uses_soft_top and self.score_method == RELATIVE_ACTIVATION_SCORE:
+            metrics["mlp_mask/weighted_used_relative_activation"] = float(
+                bool(weighted_selected_ranks)
+            )
+        metrics.update(score_metrics)
+        if self.needs_forward_score:
             metrics.update(
                 {
                     "mlp_activation/ema_mean": float(self.activation_ema.mean().item()),
@@ -625,6 +859,14 @@ class MLPChannelInterventionController:
                     "mlp_relative_activation/min": float(
                         self.relative_activation_score.min().item()
                     ),
+                }
+            )
+        if self.selection_score_initialized:
+            metrics.update(
+                {
+                    "mlp_score/ema_mean": float(self.selection_score.mean().item()),
+                    "mlp_score/ema_max": float(self.selection_score.max().item()),
+                    "mlp_score/ema_min": float(self.selection_score.min().item()),
                 }
             )
         timings = {
@@ -651,6 +893,7 @@ class MLPChannelInterventionController:
             "mlp_mask/selection_is_weighted_random": float(
                 self.selection_strategy == WEIGHTED_RANDOM_SELECTION
             ),
+            "mlp_mask/selection_is_soft_top": float(self.uses_soft_top),
             "mlp_mask/random_scope_is_global": float(self.random_scope == GLOBAL_RANDOM_SCOPE),
             "mlp_mask/random_seed": float(self.random_seed),
             "mlp_mask/weighted_max_ratio": float(self.weighted_max_ratio),
@@ -661,6 +904,36 @@ class MLPChannelInterventionController:
             "mlp_relative_activation/initialized": float(
                 self.relative_activation_initialized
             ),
+            "mlp_score/is_relative_activation": float(
+                self.score_method == RELATIVE_ACTIVATION_SCORE
+            ),
+            "mlp_score/is_output_contribution": float(
+                self.score_method == OUTPUT_CONTRIBUTION_SCORE
+            ),
+            "mlp_score/is_gradient_activation": float(
+                self.score_method == GRADIENT_ACTIVATION_SCORE
+            ),
+            "mlp_score/is_causal_ablation": float(
+                self.score_method == CAUSAL_ABLATION_SCORE
+            ),
+            "mlp_score/ema_beta": float(self.score_ema_beta),
+            "mlp_score/initialized": float(self.selection_score_initialized),
+            "mlp_causal/group_reward_gap_ema": float(self.causal_reward_gap_ema),
+            "mlp_causal/group_reward_gap_initialized": float(
+                self.causal_reward_gap_initialized
+            ),
+            "mlp_causal/observations": float(self.causal_observations),
+            "mlp_causal/assignment_contrast_initialized": float(
+                self.causal_assignment_contrast_initialized
+            ),
+            "mlp_causal/last_group_reward_gap": float(self._last_causal_reward_gap),
+            "mlp_causal/last_group_reward_gap_residual": float(
+                self._last_causal_residual
+            ),
+            "mlp_causal/estimator_is_randomized_group": float(
+                self.score_method == CAUSAL_ABLATION_SCORE
+            ),
+            "mlp_causal/is_exact_single_channel_ablation": 0.0,
             "mlp_mask/layers": float(self.num_layers),
             "mlp_mask/channels_per_layer": float(self.intermediate_size),
             "mlp_mask/masked_per_layer": float(current / self.num_layers),
@@ -678,7 +951,12 @@ class MLPChannelInterventionController:
 
     def state_dict(self) -> dict[str, Any]:
         return {
-            "score_type": _ACTIVATION_SCORE_TYPE,
+            "checkpoint_format": _CHECKPOINT_FORMAT,
+            # Keep the v1 marker so old analysis scripts still recognize the
+            # original relative-activation fields in a v2 checkpoint.
+            "score_type": _LEGACY_ACTIVATION_SCORE_TYPE,
+            "score_method": self.score_method,
+            "score_ema_beta": self.score_ema_beta,
             "num_layers": self.num_layers,
             "intermediate_size": self.intermediate_size,
             "mask_ratio": self.mask_ratio,
@@ -693,25 +971,67 @@ class MLPChannelInterventionController:
             "ever_masked": self.ever_masked.cpu(),
             "activation_ema": self.activation_ema.cpu(),
             "relative_activation_score": self.relative_activation_score.cpu(),
+            "selection_score": self.selection_score.cpu(),
             "activation_ema_initialized": self.activation_ema_initialized,
             "relative_activation_initialized": self.relative_activation_initialized,
+            "selection_score_initialized": self.selection_score_initialized,
+            "causal_reward_gap_ema": self.causal_reward_gap_ema,
+            "causal_reward_gap_initialized": self.causal_reward_gap_initialized,
+            "causal_observations": self.causal_observations,
+            "last_causal_reward_gap": self._last_causal_reward_gap,
+            "last_causal_residual": self._last_causal_residual,
+            "causal_assignment_contrast": self.causal_assignment_contrast.cpu(),
+            "causal_assignment_contrast_initialized": (
+                self.causal_assignment_contrast_initialized
+            ),
             "mask_version": self.mask_version,
             "cumulative_mask_assignments": self.cumulative_mask_assignments,
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
+        checkpoint_format = state.get("checkpoint_format")
         checkpoint_score_type = state.get("score_type")
         legacy_random_checkpoint = (
-            checkpoint_score_type is None
+            checkpoint_format is None
+            and checkpoint_score_type is None
             and self.selection_strategy == RANDOM_SELECTION
             and state.get("selection_strategy") == RANDOM_SELECTION
         )
-        if checkpoint_score_type != _ACTIVATION_SCORE_TYPE and not legacy_random_checkpoint:
+        legacy_relative_checkpoint = (
+            checkpoint_format is None
+            and checkpoint_score_type == _LEGACY_ACTIVATION_SCORE_TYPE
+        )
+        if checkpoint_format not in {None, _CHECKPOINT_FORMAT}:
+            raise ValueError(
+                f"incompatible MLP mask checkpoint format {checkpoint_format!r}; "
+                f"expected {_CHECKPOINT_FORMAT!r}"
+            )
+        if checkpoint_format is None and not (
+            legacy_random_checkpoint or legacy_relative_checkpoint
+        ):
             raise ValueError(
                 "MLP mask checkpoint uses an incompatible score definition "
-                f"{checkpoint_score_type!r}; expected {_ACTIVATION_SCORE_TYPE!r}. "
+                f"{checkpoint_score_type!r}; expected {_LEGACY_ACTIVATION_SCORE_TYPE!r}. "
                 "Start a new run instead of resuming a legacy saliency checkpoint."
             )
+        if legacy_relative_checkpoint and self.score_method != RELATIVE_ACTIVATION_SCORE:
+            raise ValueError(
+                "a v1 relative-activation checkpoint cannot initialize "
+                f"score_method={self.score_method!r}"
+            )
+        if checkpoint_format == _CHECKPOINT_FORMAT:
+            checkpoint_score_method = str(state["score_method"])
+            if checkpoint_score_method != self.score_method:
+                raise ValueError(
+                    f"checkpoint score_method={checkpoint_score_method!r} does not match "
+                    f"controller score_method={self.score_method!r}"
+                )
+            checkpoint_score_ema_beta = float(state["score_ema_beta"])
+            if checkpoint_score_ema_beta != self.score_ema_beta:
+                raise ValueError(
+                    f"checkpoint score_ema_beta={checkpoint_score_ema_beta} does not match "
+                    f"controller score_ema_beta={self.score_ema_beta}"
+                )
         checkpoint_strategy = str(state.get("selection_strategy", self.selection_strategy))
         if checkpoint_strategy != self.selection_strategy:
             raise ValueError(
@@ -771,26 +1091,61 @@ class MLPChannelInterventionController:
             state.get("relative_activation_score", torch.zeros(expected)),
             dtype=torch.float32,
         )
+        selection_score_default = (
+            relative_activation_score
+            if legacy_relative_checkpoint
+            else torch.zeros(expected)
+        )
+        selection_score = torch.as_tensor(
+            state.get("selection_score", selection_score_default),
+            dtype=torch.float32,
+        )
+        causal_assignment_contrast = torch.as_tensor(
+            state.get("causal_assignment_contrast", torch.zeros(expected)),
+            dtype=torch.float32,
+        )
         if (
             tuple(ever_masked.shape) != expected
             or tuple(activation_ema.shape) != expected
             or tuple(relative_activation_score.shape) != expected
+            or tuple(selection_score.shape) != expected
+            or tuple(causal_assignment_contrast.shape) != expected
         ):
             raise ValueError(
                 "checkpoint history/activation shapes must match controller shape "
                 f"{expected}, got ever={tuple(ever_masked.shape)}, "
                 f"ema={tuple(activation_ema.shape)}, "
-                f"relative={tuple(relative_activation_score.shape)}"
+                f"relative={tuple(relative_activation_score.shape)}, "
+                f"selection={tuple(selection_score.shape)}, "
+                f"causal_contrast={tuple(causal_assignment_contrast.shape)}"
             )
         self.keep_mask.copy_(keep_mask)
         self.ever_masked.copy_(ever_masked)
         self.activation_ema.copy_(activation_ema)
         self.relative_activation_score.copy_(relative_activation_score)
+        self.selection_score.copy_(selection_score)
+        self.causal_assignment_contrast.copy_(causal_assignment_contrast)
         self.activation_ema_initialized = bool(
             state.get("activation_ema_initialized", False if legacy_random_checkpoint else True)
         )
         self.relative_activation_initialized = bool(
             state.get("relative_activation_initialized", False)
+        )
+        self.selection_score_initialized = bool(
+            state.get(
+                "selection_score_initialized",
+                legacy_relative_checkpoint and self.relative_activation_initialized,
+            )
+        )
+        self.causal_reward_gap_ema = float(state.get("causal_reward_gap_ema", 0.0))
+        self.causal_reward_gap_initialized = bool(
+            state.get("causal_reward_gap_initialized", False)
+        )
+        self.causal_observations = int(state.get("causal_observations", 0))
+        self._last_causal_reward_gap = float(state.get("last_causal_reward_gap", 0.0))
+        self._last_causal_residual = float(state.get("last_causal_residual", 0.0))
+        self.causal_assignment_contrast_initialized = bool(
+            state.get("causal_assignment_contrast_initialized", False)
         )
         self.mask_version = int(state.get("mask_version", 0))
         self.cumulative_mask_assignments = int(state.get("cumulative_mask_assignments", 0))
@@ -800,6 +1155,8 @@ class MLPChannelInterventionController:
         self.load_state_dict(other.state_dict())
 
     def _score_device(self) -> torch.device:
+        if self._gradient_activation_sum:
+            return next(iter(self._gradient_activation_sum.values())).device
         if self._activation_level_sum:
             return next(iter(self._activation_level_sum.values())).device
         if torch.cuda.is_available():
@@ -824,7 +1181,11 @@ def install_hf_mlp_intervention(model: torch.nn.Module, controller: MLPChannelIn
             if args or kwargs:
                 raise TypeError("patched dense MLP expects only hidden_state")
             activation = this.act_fn(this.gate_proj(hidden_state)) * this.up_proj(hidden_state)
-            activation = controller.apply(_layer_idx, activation)
+            activation = controller.apply(
+                _layer_idx,
+                activation,
+                down_weight=this.down_proj.weight,
+            )
             return this.down_proj(activation)
 
         module.forward = MethodType(forward, module)

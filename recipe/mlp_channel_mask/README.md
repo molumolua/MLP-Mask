@@ -8,7 +8,7 @@
 在同一个 policy step 中同时优化两条路径：
 
 - `clean`：所有 MLP channels 正常可用；
-- `masked`：每一个 Transformer block 内，屏蔽贡献度最高的 10% MLP channels。
+- `masked`：每一个 Transformer block 内，通过 soft-top 屏蔽 10% MLP channels。
 
 最终部署和验证仍使用完整的 clean 模型。masked 路径是训练期 intervention，不是剪枝，也不改变参数量。
 
@@ -38,10 +38,11 @@ masked 路径只在 `down_proj` 之前插入逐 channel mask：
 5. 将两次输出恢复到原始交错顺序，分别保留 route、mask version 和 vLLM behavior log-prob。
 6. clean 与 masked 使用不同的 GRPO `uid`，各自在本 route 的 8 个样本内计算均值和标准差。
 7. actor update 先按 route 拆成同质 micro-batches，再在同一个 optimizer step 中累计两条路径的梯度。
-8. clean backward 可在 mask-refresh step 或显式配置为每个 step 时收集贡献度。
-9. 到达 `test_freq` 时，先做无 mask 的 clean validation，再选择下一版 mask。
+8. clean backward 收集所选评分需要的统计；因果版本则使用真实的两路 reward gap。
+9. step 结束后按新评分准备下一版 soft-top mask。
 
-初始 `mask_version=0` 时 mask 全为 1，因此第一个 train step 的两个 route 在函数上相同，只是独立采样。这个 step 用来建立第一版贡献度；step 结束后生成 `mask_version=1`。
+默认在第一个 rollout 前先生成一版均匀随机 mask。评分可用后，后续版本改用
+soft-top 权重；同一个 step 的 rollout、old-logprob 和 actor update 始终共享同一版本。
 
 ## route 条件下的 GRPO
 
@@ -76,75 +77,48 @@ L=\frac12L_{clean}+\frac12L_{masked}.
 样本不会走 clean actor route，反之亦然。vLLM 产生的 `rollout_log_probs` 仅用于
 rollout/actor 差异诊断，不直接充当 `old_log_probs`。
 
-## 贡献度与每层 top 10%
+## 四种评分与统一 soft-top
 
-只在 clean policy-loss backward 上统计：
-
-\[
-c_{l,j}=\frac{1}{N}
-\sum_{t\in\text{有效 response loss positions}}
-\left|z_{l,t,j}\frac{\partial L_{clean}}{\partial z_{l,t,j}}\right|.
-\]
-
-这里使用的是产生 response token log-prob 的 causal position，即 response token 前一个位置，而不是简单取输入序列最后 `response_length` 个激活。padding 和无效 response token 均被排除。
-
-多 GPU 上先对分子和 token 数做 all-reduce，再形成平均值。随后使用 EMA：
+`score_method` 与选择方式彼此独立。保留的原评分是
+`relative_activation`：先按样本计算有效 response causal positions 上的 channel
+RMS，再与此前的正常激活 EMA 比较：
 
 \[
-\bar c_l^{(v)}=
-\beta\bar c_l^{(v-1)}+(1-\beta)c_l^{(v)},
+s_{l,j}=\frac{\operatorname{RMS}(z_{l,j})-\operatorname{EMA}_{l,j}}
+{\max(\operatorname{EMA}_{l,j},\epsilon)}.
 \]
 
-默认配置为 `beta=0.95`；第一次刷新直接使用当前统计。设置 `beta=0` 时，
-每次更新都会完全替换旧值，只使用本次收集 step 的统计。对每一层独立计算
+新增三种评分：
 
-\[
-k=\max\left(1,\operatorname{round}(0.1d_{ff})\right),
-\qquad
-m_{l,j}=0\ \text{if}\ j\in\operatorname{TopK}(\bar c_l,k).
-\]
+- `output_contribution`：
+  \(s_{l,j}=\operatorname{RMS}(z_{l,j})\lVert W_{d,l}[:,j]\rVert_2\)。它把
+  channel 激活与下投影列范数结合，对 `z_j` 和对应权重列的互逆缩放不敏感。
+- `gradient_activation`：
+  \(s_{l,j}=\operatorname{mean}|z_{l,t,j}\,\partial J/\partial z_{l,t,j}|\)。它使用
+  clean policy objective 的真实 backward gradient，因而是当前任务条件下的一阶评分。
+- `causal_ablation`：从实际 clean–masked reward gap 和每步变化的随机分组 mask
+  在线估计 channel mask 概率对分组干预效果的影响。实现使用 soft-top 无放回采样
+  的精确 log-prob score-function contrast，因此在权重自适应变为非均匀后仍与实际
+  assignment policy 一致。一次 rollout 只提供整个 mask 的标量结果，所以这是随机
+  分组估计，不是昂贵的逐 channel 精确消融；指标名称明确使用 `group_*`。
 
-所以不会出现浅层或深层垄断全局 mask 配额的情况。每层始终屏蔽相同数量的 channels。
+前三种只统计产生 response token log-prob 的 causal position，并排除 padding 和
+无效 response token。多 actor rank 会先 all-reduce，再更新评分。`score_ema_beta`
+控制最终选择分数的平滑；原评分另用 `activation_ema_beta` 维护正常激活基线。
 
-作为对照实验，也支持 `selection_strategy=random`。random 模式不计算
-gradient × activation，而是在每次 refresh 时对每一层独立、均匀地采样恰好
-`round(mask_ratio * d_ff)` 个 channels。采样使用 `random_seed + mask_version`，
-因此不同 actor worker 会得到相同 mask，同一实验可以复现，而新版本会重新采样。
-它仍保留 version 0 的全 1 warmup：第一个 train step 结束后才产生第一版随机 mask。
-
-random 采样范围由 `random_scope` 控制：
-
-- `per_layer`：每层精确采样 `round(mask_ratio * d_ff)` 个 channels；
-- `global`：在全部 `(layer, channel)` 中精确采样
-  `round(mask_ratio * num_layers * d_ff)` 个位置，每层实际数量允许波动。
-
-两者的全模型期望比例相同；模型每层宽度一致时，`per_layer` 的总量也与 global
-基本相同，但它消除了层间采样方差。
-
-`selection_strategy=weighted_random` 在逐层 random 的基础上按 clean saliency
-百分位增加采样权重。对每层 channel 的升序百分位 rank `r in [0, 1]` 使用固定公式：
+四种评分统一使用 `selection_strategy=soft_top`。每层先把评分变成升序百分位
+`r in [0,1]`，再按
 
 ```text
 weight = 1 + (weighted_max_ratio - 1) * r ** weighted_rank_power
 ```
 
-默认 `weighted_max_ratio=4`、`weighted_rank_power=2`，最高 saliency channel 的
-权重最多是最低 channel 的 4 倍。采样始终无放回且每层精确屏蔽 10%。该模式
-没有权重 warmup 或渐进增强：取得第一版 saliency 后立即使用完整固定权重。
-step 1 先使用 uniform random mask 并收集 saliency，从 step 2 开始 weighted random。
-配套 weighted-random bash 设置 `saliency_update_every_step=true` 和
-`saliency_ema_beta=0`：step t 的 clean backward 只计算当前 step saliency，step
-结束后立即据此采样 step t+1 的 mask。权重仍是上述固定公式，不做渐进增强。
+无放回采样恰好 `round(mask_ratio * d_ff)` 个 channels。默认最高权重是最低权重的
+4 倍、`weighted_rank_power=2`。这不是 hard top-k：高分 channel 更常被选中，但
+不会被永久锁定；每层配额严格相同。评分尚未建立时使用均匀权重。
 
-设置 `random_resample_every_step=true` 后使用另一种时序：每个 train step 的
-rollout 之前先生成一版新随机 mask，所以 step 1 就使用 `mask_version=1`，没有
-全 1 warmup。同一个 step 内 mask 保持不变，只在下一个 step 开始前再次采样。
-这个频率独立于 validation/checkpoint 的 `test_freq`。
-
-默认 top-saliency 模式只在 `warmup_steps=1` 和之后每个 `test_freq` 对应的
-单个 train step 上收集贡献度。设置 `saliency_update_every_step=true` 后，
-top-saliency 或 weighted-random 会在每个 train step 收集并更新。uniform random
-模式完全不挂 activation-gradient hook，也不执行 saliency all-reduce。
+历史的 `weighted_random` 仍作为原 relative-activation 实验的兼容别名保留；新实验
+统一写 `soft_top`。`selection_strategy=random` 的逐层/全局均匀随机对照也继续可用。
 
 ## 为什么 validation 使用 clean route
 
@@ -154,7 +128,7 @@ top-saliency 或 weighted-random 会在每个 train step 收集并更新。unifo
 
 1. 强制 route=`clean`，不使用任何 mask；
 2. 完成 validation；
-3. 根据本 step 的 clean backward 统计刷新 mask；
+3. 根据本 step 的评分统计刷新 mask；
 4. 新 mask 从下一个 train step 生效。
 
 这样验证不会受到旧 mask 或刚刷新 mask 的影响。
@@ -167,9 +141,9 @@ top-saliency 或 weighted-random 会在每个 train step 收集并更新。unifo
 - vLLM 类在 engine 构建和 CUDA graph capture 之前完成 patch。每层 mask tensor 的地址固定，route 切换只做 in-place copy，不会每 token 在线重建 hook 或 mask。
 - mask 乘法复杂度为 `O(L*T*d_ff)`，相对 MLP 矩阵乘法通常很小，但它不会减少 GEMM FLOPs，所以这不是推理加速方案。
 - actor 仍处理总共 16 条 trajectory。route 分开 packing 会增加少量调度开销，但总 token 数不变。
-- saliency 的额外 `abs(z*grad)` 和 channel reduction 默认只发生在刷新 step；
-  every-step 模式下则每步发生。它会增加显存带宽和临时张量压力，因此提供了
-  独立 timing。
+- `relative_activation` 和 `output_contribution` 增加一次 channel reduction；
+  `gradient_activation` 还计算 `abs(z*grad)`。every-step 模式下这些工作每步发生，
+  因而提供独立 timing。`causal_ablation` 不安装 activation hook。
 
 如果把配置改成 16 clean + 16 masked，总 rollout 和 actor token 预算才会接近基线的两倍。
 
@@ -193,11 +167,11 @@ mask 指标：
 - `mlp_mask/rollout_version_used`：本 step rollout 实际使用的版本
 - `mlp_mask/random_resample_every_step`：是否在每个 step 的 rollout 前随机重采样
 - `mlp_mask/random_scope_is_global`：1 表示全局随机配额，0 表示逐层配额
-- `mlp_mask/selection_is_weighted_random`
+- `mlp_mask/selection_is_soft_top`
 - `mlp_mask/weighted_max_ratio` / `weighted_rank_power`
 - `mlp_mask/weighted_selected_rank_mean`
 - `mlp_mask/weighted_selected_top_1pct_fraction`
-- `mlp_mask/weighted_used_saliency`
+- `mlp_mask/soft_top_used_score`
 - `mlp_mask/current_channels` / `current_fraction`
 - `mlp_mask/masked_per_layer_min` / `max`：用于确认 block 内配额严格平衡
 - `mlp_mask/ever_unique_channels` / `ever_unique_fraction`
@@ -205,9 +179,11 @@ mask 指标：
 - `mlp_mask/new_unique_channels`
 - `mlp_mask/overlap_with_previous` / `turnover_fraction`
 - `mlp_mask/cumulative_assignments`
-- `mlp_saliency/mean|max|min|response_tokens|layers_observed`
-- `mlp_saliency/collection_enabled`
-- `mlp_saliency/update_every_step`, `mlp_saliency/ema_beta`
+- `mlp_score/is_relative_activation|is_output_contribution|is_gradient_activation|is_causal_ablation`
+- `mlp_score/current_mean|max|min` 与 `mlp_score/ema_mean|max|min`
+- `mlp_score/collection_enabled`, `mlp_score/update_every_step`, `mlp_score/ema_beta`
+- `mlp_causal/group_reward_gap|group_reward_gap_ema|group_reward_gap_residual`
+- `mlp_causal/observations|score_updated`
 
 所有新增阶段都有秒级 timing，包括：
 
@@ -218,9 +194,9 @@ mask 指标：
 - `timing_s/mlp_prefix_cache_reset_before_clean|between_routes|after_masked`
 - rollout/actor route switch
 - clean/masked actor forward-backward
-- `timing_s/mlp_saliency_accumulate_cpu`（hook 的 CPU dispatch，不含异步 GPU 完成时间）
-- `timing_s/mlp_saliency_enabled_actor_update`（开启 saliency 的完整 actor-update wall time）
-- saliency all-reduce、mask selection、总 refresh 和 actor→rollout mask sync
+- `timing_s/mlp_activation_accumulate_cpu`（hook 的 CPU dispatch，不含异步 GPU 完成时间）
+- `timing_s/mlp_activation_enabled_actor_update`（开启评分统计的完整 actor-update wall time）
+- score all-reduce、mask selection、总 refresh 和 actor→rollout mask sync
 - `timing_s/testing_clean`
 
 validation 会在每个 `data_source` 内按规范化后的完整题面合并重复行，而不是按可能
@@ -236,7 +212,8 @@ GRPO 不使用 critic，因此不存在可正确解释的 `clean_critic/masked_c
 
 - 当前 keep mask；
 - 历史 ever-masked bitmap；
-- EMA saliency；
+- 激活基线、选择分数及其 EMA 状态；
+- 分组因果估计的 reward-gap 基线与观测数；
 - mask version；
 - cumulative assignments。
 
@@ -247,6 +224,15 @@ GRPO 不使用 critic，因此不存在可正确解释的 `clean_critic/masked_c
 ```bash
 cd /Users/molu/verl-mlp_channels_mask
 bash recipe/mlp_channel_mask/grpo_mlp_channel_mask_qwen3-4b_offline.sh
+```
+
+上面的默认脚本保留原 `relative_activation` 评分，并改为 soft-top 选择。三种新增评分
+各有独立脚本：
+
+```bash
+bash recipe/mlp_channel_mask/grpo_mlp_channel_mask_qwen3-4b_output_contribution_soft_top_offline.sh
+bash recipe/mlp_channel_mask/grpo_mlp_channel_mask_qwen3-4b_gradient_activation_soft_top_offline.sh
+bash recipe/mlp_channel_mask/grpo_mlp_channel_mask_qwen3-4b_causal_ablation_soft_top_offline.sh
 ```
 
 按原 refresh 周期随机屏蔽每层 1% channels 的对照实验（脚本名为历史保留）：

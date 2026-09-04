@@ -6,6 +6,7 @@ Run without the training stack installed:
 
 from __future__ import annotations
 
+import itertools
 import unittest
 from types import ModuleType
 from unittest import mock
@@ -14,11 +15,15 @@ import torch
 from torch import nn
 
 from .intervention import (
+    CAUSAL_ABLATION_SCORE,
     CLEAN_ROUTE,
+    GRADIENT_ACTIVATION_SCORE,
     GLOBAL_RANDOM_SCOPE,
     MASKED_ROUTE,
     MLPChannelInterventionController,
+    OUTPUT_CONTRIBUTION_SCORE,
     RANDOM_SELECTION,
+    SOFT_TOP_SELECTION,
     WEIGHTED_RANDOM_SELECTION,
     install_hf_mlp_intervention,
     install_vllm_class_intervention,
@@ -328,13 +333,23 @@ class MLPChannelInterventionTest(unittest.TestCase):
         controller.refresh_mask()
         legacy_state = controller.state_dict()
         for key in (
+            "checkpoint_format",
             "score_type",
+            "score_method",
+            "score_ema_beta",
             "activation_ema_beta",
             "relative_activation_epsilon",
             "activation_ema",
             "relative_activation_score",
             "activation_ema_initialized",
             "relative_activation_initialized",
+            "selection_score",
+            "selection_score_initialized",
+            "causal_reward_gap_ema",
+            "causal_reward_gap_initialized",
+            "causal_observations",
+            "last_causal_reward_gap",
+            "last_causal_residual",
         ):
             legacy_state.pop(key)
         legacy_state["ema_saliency"] = torch.zeros((2, 10))
@@ -413,6 +428,121 @@ class MLPChannelInterventionTest(unittest.TestCase):
                 selection_strategy=WEIGHTED_RANDOM_SELECTION,
                 random_scope=GLOBAL_RANDOM_SCOPE,
             )
+
+    def test_output_contribution_score_is_scale_invariant(self) -> None:
+        def collect(scale: torch.Tensor) -> MLPChannelInterventionController:
+            controller = MLPChannelInterventionController(
+                num_layers=1,
+                intermediate_size=4,
+                mask_ratio=0.25,
+                selection_strategy=SOFT_TOP_SELECTION,
+                score_method=OUTPUT_CONTRIBUTION_SCORE,
+            )
+            activation = torch.tensor(
+                [[[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]]]
+            ) * scale
+            down_weight = torch.diag(torch.tensor([4.0, 3.0, 2.0, 1.0]) / scale)
+            controller.set_route(CLEAN_ROUTE, collect_activation=True)
+            controller.set_response_token_mask(torch.ones((1, 2)))
+            observed = activation.requires_grad_(True)
+            controller.apply(0, observed, down_weight=down_weight).sum().backward()
+            controller.end_batch()
+            controller.refresh_mask()
+            return controller
+
+        reference = collect(torch.ones(4))
+        rescaled = collect(torch.tensor([2.0, 0.5, 4.0, 0.25]))
+
+        expected = torch.tensor([4.0, 6.0, 6.0, 4.0])
+        self.assertTrue(torch.allclose(reference.selection_score[0], expected))
+        self.assertTrue(
+            torch.allclose(rescaled.selection_score, reference.selection_score)
+        )
+        self.assertTrue(reference.selection_score_initialized)
+
+    def test_gradient_activation_score_uses_backward_gradient(self) -> None:
+        controller = MLPChannelInterventionController(
+            num_layers=1,
+            intermediate_size=4,
+            mask_ratio=0.25,
+            selection_strategy=SOFT_TOP_SELECTION,
+            score_method=GRADIENT_ACTIVATION_SCORE,
+        )
+        activation = torch.tensor(
+            [[[1.0, -2.0, 3.0, 4.0], [2.0, 2.0, -1.0, 8.0]]],
+            requires_grad=True,
+        )
+        loss_weight = torch.tensor(
+            [[[2.0, 3.0, -1.0, 0.5], [-1.0, 1.0, 4.0, 0.25]]]
+        )
+        controller.set_route(CLEAN_ROUTE, collect_activation=True)
+        controller.set_response_token_mask(torch.ones((1, 2)))
+        (controller.apply(0, activation) * loss_weight).sum().backward()
+        controller.end_batch()
+        controller.refresh_mask()
+
+        expected = (activation.detach() * loss_weight).abs().mean(dim=(0, 1))
+        self.assertTrue(torch.allclose(controller.selection_score[0], expected))
+
+    def test_causal_group_ablation_uses_realized_reward_gap(self) -> None:
+        controller = MLPChannelInterventionController(
+            num_layers=1,
+            intermediate_size=10,
+            mask_ratio=0.20,
+            selection_strategy=SOFT_TOP_SELECTION,
+            score_method=CAUSAL_ABLATION_SCORE,
+            score_ema_beta=0.0,
+            random_seed=11,
+        )
+        controller.refresh_mask()
+        masked = ~controller.keep_mask.clone()
+
+        first = controller.observe_causal_ablation(1.0)
+        second = controller.observe_causal_ablation(3.0)
+
+        self.assertEqual(first["mlp_causal/score_updated"], 0.0)
+        self.assertEqual(second["mlp_causal/score_updated"], 1.0)
+        self.assertTrue(torch.all(controller.selection_score[masked] > 0))
+        self.assertTrue(torch.all(controller.selection_score[~masked] < 0))
+        self.assertEqual(controller.causal_observations, 2)
+
+        restored = MLPChannelInterventionController(
+            num_layers=1,
+            intermediate_size=10,
+            mask_ratio=0.20,
+            selection_strategy=SOFT_TOP_SELECTION,
+            score_method=CAUSAL_ABLATION_SCORE,
+            score_ema_beta=0.0,
+            random_seed=11,
+        )
+        restored.load_state_dict(controller.state_dict())
+        self.assertTrue(torch.equal(restored.selection_score, controller.selection_score))
+        self.assertTrue(
+            torch.equal(
+                restored.causal_assignment_contrast,
+                controller.causal_assignment_contrast,
+            )
+        )
+        self.assertEqual(restored.causal_observations, 2)
+
+    def test_causal_sampling_contrast_has_zero_assignment_expectation(self) -> None:
+        weights = torch.tensor([1.0, 2.0, 4.0])
+        expected_contrast = torch.zeros_like(weights)
+        probability_sum = 0.0
+        for order in itertools.permutations(range(3), 2):
+            remaining_weight = float(weights.sum().item())
+            probability = 1.0
+            for selected_idx in order:
+                probability *= float(weights[selected_idx].item()) / remaining_weight
+                remaining_weight -= float(weights[selected_idx].item())
+            contrast = MLPChannelInterventionController._sampling_score_contrast(
+                weights, torch.tensor(order)
+            )
+            expected_contrast.add_(contrast, alpha=probability)
+            probability_sum += probability
+
+        self.assertAlmostEqual(probability_sum, 1.0)
+        self.assertTrue(torch.allclose(expected_contrast, torch.zeros(3), atol=1e-6))
 
     def test_unique_history_and_checkpoint_round_trip(self) -> None:
         controller = self._controller()

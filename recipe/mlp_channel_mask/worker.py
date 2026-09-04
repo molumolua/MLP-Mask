@@ -54,8 +54,10 @@ class MLPChannelActorRolloutRefWorker(ActorRolloutRefWorker):
                 config.get("relative_activation_epsilon", 1e-6)
             ),
             selection_strategy=str(
-                config.get("selection_strategy", "top_relative_activation")
+                config.get("selection_strategy", "soft_top")
             ),
+            score_method=str(config.get("score_method", "relative_activation")),
+            score_ema_beta=float(config.get("score_ema_beta", 0.0)),
             random_seed=int(config.get("random_seed", 42)),
             random_scope=str(config.get("random_scope", "per_layer")),
             weighted_max_ratio=float(config.get("weighted_max_ratio", 4.0)),
@@ -223,6 +225,14 @@ class MLPChannelActorRolloutRefWorker(ActorRolloutRefWorker):
             "timings": timings,
             "mask_version": self.actor_mlp_controller.mask_version,
         }
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def observe_mlp_causal_effect(self, reward_gap_clean_minus_masked: float):
+        """Feed one realized group-ablation outcome to the online estimator."""
+        assert self._is_actor
+        return self.actor_mlp_controller.observe_causal_ablation(
+            reward_gap_clean_minus_masked
+        )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get_mlp_mask_status(self):

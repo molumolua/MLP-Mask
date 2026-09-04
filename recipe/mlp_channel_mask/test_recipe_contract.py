@@ -22,12 +22,14 @@ class RecipeContractTest(unittest.TestCase):
         self.assertEqual(rollout["n"], 16)
         self.assertEqual(intervention["n_clean"] + intervention["n_masked"], rollout["n"])
         self.assertAlmostEqual(intervention["mask_ratio"], 0.10)
-        self.assertEqual(intervention["selection_strategy"], "top_relative_activation")
+        self.assertEqual(intervention["selection_strategy"], "soft_top")
+        self.assertEqual(intervention["score_method"], "relative_activation")
+        self.assertEqual(intervention["score_ema_beta"], 0.0)
         self.assertEqual(intervention["random_seed"], 42)
         self.assertEqual(intervention["random_scope"], "per_layer")
         self.assertEqual(intervention["weighted_max_ratio"], 4.0)
         self.assertEqual(intervention["weighted_rank_power"], 2.0)
-        self.assertFalse(intervention["random_resample_every_step"])
+        self.assertTrue(intervention["random_resample_every_step"])
         self.assertTrue(intervention["activation_update_every_step"])
         self.assertAlmostEqual(intervention["activation_ema_beta"], 0.95)
         self.assertAlmostEqual(intervention["relative_activation_epsilon"], 1e-6)
@@ -81,8 +83,13 @@ class RecipeContractTest(unittest.TestCase):
         self.assertIn("mask_ratio=${mask_ratio:-0.01}", launcher)
         self.assertIn("random_seed=${random_seed:-42}", launcher)
         self.assertIn("random_scope=${random_scope:-per_layer}", launcher)
+        self.assertIn(
+            "random_resample_every_step=${random_resample_every_step:-False}",
+            launcher,
+        )
         self.assertIn("actor_rollout_ref.mlp_intervention.selection_strategy=${selection_strategy}", base_launcher)
         self.assertIn("actor_rollout_ref.mlp_intervention.random_seed=${random_seed}", base_launcher)
+        self.assertIn('if [[ "${selection_strategy}" == "random" ]]', base_launcher)
 
     def test_random_every_step_launcher_resamples_before_each_rollout(self) -> None:
         launcher = (
@@ -168,6 +175,54 @@ class RecipeContractTest(unittest.TestCase):
         self.assertIn("weighted_rank_power=${weighted_rank_power:-2.0}", launcher)
         self.assertIn("random_resample_every_step=${random_resample_every_step:-True}", launcher)
         self.assertIn("activation_update_every_step=${activation_update_every_step:-True}", launcher)
+
+    def test_three_new_score_launchers_share_soft_top_selection(self) -> None:
+        expected = {
+            "grpo_mlp_channel_mask_qwen3-4b_output_contribution_soft_top_offline.sh": (
+                "output_contribution",
+                "True",
+            ),
+            "grpo_mlp_channel_mask_qwen3-4b_gradient_activation_soft_top_offline.sh": (
+                "gradient_activation",
+                "True",
+            ),
+            "grpo_mlp_channel_mask_qwen3-4b_causal_ablation_soft_top_offline.sh": (
+                "causal_ablation",
+                "False",
+            ),
+        }
+        base_launcher = (
+            RECIPE_DIR / "grpo_mlp_channel_mask_qwen3-4b_offline.sh"
+        ).read_text()
+        trainer_source = (RECIPE_DIR / "trainer.py").read_text()
+        worker_source = (RECIPE_DIR / "worker.py").read_text()
+
+        for filename, (score_method, activation_update) in expected.items():
+            launcher = (RECIPE_DIR / filename).read_text()
+            self.assertIn("selection_strategy=${selection_strategy:-soft_top}", launcher)
+            self.assertIn(
+                f"score_method=${{score_method:-{score_method}}}", launcher
+            )
+            self.assertIn(
+                "random_resample_every_step=${random_resample_every_step:-True}",
+                launcher,
+            )
+            self.assertIn(
+                "activation_update_every_step=${activation_update_every_step:-"
+                f"{activation_update}}}",
+                launcher,
+            )
+
+        self.assertIn(
+            "actor_rollout_ref.mlp_intervention.score_method=${score_method}",
+            base_launcher,
+        )
+        self.assertIn(
+            "actor_rollout_ref.mlp_intervention.score_ema_beta=${score_ema_beta}",
+            base_launcher,
+        )
+        self.assertIn("observe_mlp_causal_effect", trainer_source)
+        self.assertIn("observe_mlp_causal_effect", worker_source)
 
     def test_validation_merges_duplicate_prompts_and_logs_pass_at_k(self) -> None:
         config = yaml.safe_load((RECIPE_DIR / "config" / "ppo_mlp_channel_mask.yaml").read_text())

@@ -1,122 +1,60 @@
 #!/usr/bin/env bash
 set -euxo pipefail
 
-# This recipe is intentionally offline: W&B writes a local run directory that
-# can later be uploaded with `wandb sync`.
 export WANDB_MODE=${WANDB_MODE:-offline}
 export WANDB_DIR=${WANDB_DIR:-./wandb_offline}
 export PYTHONUNBUFFERED=1
 mkdir -p "${WANDB_DIR}"
 
-# Model / cluster.
 model_name=${model_name:-Qwen3-4B-Base}
 num_gpus=${num_gpus:-4}
 tensor_model_parallel_size=${tensor_model_parallel_size:-1}
-sp_size=${sp_size:-1}
-offload=${offload:-True}
-ref_offload=${ref_offload:-True}
-mlp_intervention_enabled=${mlp_intervention_enabled:-True}
 
-# Budget-matched dual rollout: 8 clean + 8 masked = the original 16 samples.
-n_clean=${n_clean:-8}
-n_masked=${n_masked:-8}
-n_total=${n_total:-$((n_clean + n_masked))}
-mask_ratio=${mask_ratio:-0.01}
-selection_strategy=${selection_strategy:-soft_top}
-score_method=${score_method:-relative_activation}
-score_ema_beta=${score_ema_beta:-0.0}
-random_seed=${random_seed:-42}
-random_scope=${random_scope:-per_layer}
-weighted_max_ratio=${weighted_max_ratio:-4.0}
-weighted_rank_power=${weighted_rank_power:-2.0}
-random_resample_every_step=${random_resample_every_step:-True}
-if [[ "${selection_strategy}" == "random" ]]; then
-    activation_update_default=False
-else
-    case "${score_method}" in
-        relative_activation|output_contribution|gradient_activation)
-            activation_update_default=True
-            ;;
-        causal_ablation)
-            activation_update_default=False
-            ;;
-        *)
-            echo "unsupported score_method: ${score_method}" >&2
-            exit 2
-            ;;
-    esac
-fi
-activation_update_every_step=${activation_update_every_step:-${activation_update_default}}
-activation_ema_beta=${activation_ema_beta:-0.95}
-relative_activation_epsilon=${relative_activation_epsilon:-1e-6}
+# History-based relative-update allocator.
+relative_update_enabled=${relative_update_enabled:-True}
+optimizer_impl=${optimizer_impl:-recipe.mlp_channel_relative_update.optimizer}
+optimizer_name=${optimizer_name:-ChannelRelativeUpdateAdamW}
+history_ema_beta=${history_ema_beta:-0.99}
+history_power=${history_power:-0.5}
+history_floor_ratio=${history_floor_ratio:-0.1}
+multiplier_ratio_cap=${multiplier_ratio_cap:-10.0}
+warmup_steps=${warmup_steps:-16}
 
-# GRPO schedule.
+# GRPO schedule. Keep these equal across baseline/rarity/relative-update runs.
+n_rollouts=${n_rollouts:-16}
 epoch=${epoch:-10000}
 lr=${lr:-1e-6}
 lr_warmup_steps=${lr_warmup_steps:-0}
 test_and_save_freq=${test_and_save_freq:-40}
 train_prompt_bsz=${train_prompt_bsz:-16}
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-16}
-
 max_prompt_length=${max_prompt_length:-8192}
 max_response_length=${max_response_length:-4096}
 gpu_memory_utilization=${gpu_memory_utilization:-0.7}
 use_dynamic_bsz=${use_dynamic_bsz:-True}
+log_prob_micro_batch_size_per_gpu=${log_prob_micro_batch_size_per_gpu:-1}
 actor_ppo_max_token_len=$((2 * (max_prompt_length + max_response_length)))
 infer_ppo_max_token_len=$((2 * (max_prompt_length + max_response_length)))
 
-# Same train/test datasets as the DenoiseRL Qwen3-4B recipe.
 RAY_DATA_HOME=${RAY_DATA_HOME:-.}
 MODEL_PATH=${MODEL_PATH:-../Model/Qwen/${model_name}}
 TRAIN_FILE=${TRAIN_FILE:-./data/MATH7500-train.parquet}
 TEST_FILE=${TEST_FILE:-'["./data/aime25_test.parquet","./data/bbeh_data.parquet","./data/MATH500-test.parquet","./data/amc23_test.parquet","./data/aime24_test.parquet","./data/MMLU-Pro-Valid.parquet"]'}
 
-project_name=${project_name:-MLP-Channel-Intervention-4B}
-experiment_name=${experiment_name:-"grpo-${model_name}-clean${n_clean}-masked${n_masked}-${score_method}-softtop${mask_ratio}"}
+project_name=${project_name:-MLP-Channel-Relative-Update-4B}
+experiment_name=${experiment_name:-"grpo-${model_name}-relative-update-r${multiplier_ratio_cap}-beta${history_ema_beta}-power${history_power}"}
 export WANDB_RUN_ID=${WANDB_RUN_ID:-${experiment_name}}
 CKPTS_DIR=${CKPTS_DIR:-${RAY_DATA_HOME}/ckpts/${project_name}/${experiment_name}}
+rollout_data_dir=${rollout_data_dir:-${CKPTS_DIR}/rollout_data}
 
 temperature=${temperature:-1.0}
 top_p=${top_p:-1.0}
 top_k=${top_k:--1}
 val_temperature=${val_temperature:-0.6}
 val_top_p=${val_top_p:-0.95}
+python_bin=${python_bin:-/opt/homebrew/Caskroom/miniconda/base/envs/molu/bin/python}
 
-case "${mlp_intervention_enabled}" in
-    True|true)
-        trainer_module=recipe.mlp_channel_mask.main
-        mlp_intervention_args=(
-            actor_rollout_ref.mlp_intervention.enabled=True
-            actor_rollout_ref.mlp_intervention.n_clean=${n_clean}
-            actor_rollout_ref.mlp_intervention.n_masked=${n_masked}
-            actor_rollout_ref.mlp_intervention.mask_ratio=${mask_ratio}
-            actor_rollout_ref.mlp_intervention.selection_strategy=${selection_strategy}
-            actor_rollout_ref.mlp_intervention.score_method=${score_method}
-            actor_rollout_ref.mlp_intervention.score_ema_beta=${score_ema_beta}
-            actor_rollout_ref.mlp_intervention.random_seed=${random_seed}
-            actor_rollout_ref.mlp_intervention.random_scope=${random_scope}
-            actor_rollout_ref.mlp_intervention.weighted_max_ratio=${weighted_max_ratio}
-            actor_rollout_ref.mlp_intervention.weighted_rank_power=${weighted_rank_power}
-            actor_rollout_ref.mlp_intervention.random_resample_every_step=${random_resample_every_step}
-            actor_rollout_ref.mlp_intervention.activation_update_every_step=${activation_update_every_step}
-            actor_rollout_ref.mlp_intervention.activation_ema_beta=${activation_ema_beta}
-            actor_rollout_ref.mlp_intervention.relative_activation_epsilon=${relative_activation_epsilon}
-            actor_rollout_ref.mlp_intervention.warmup_steps=1
-            actor_rollout_ref.mlp_intervention.refresh_freq=${test_and_save_freq}
-        )
-        ;;
-    False|false)
-        trainer_module=verl.trainer.main_ppo
-        mlp_intervention_args=()
-        ;;
-    *)
-        echo "mlp_intervention_enabled must be True or False, got: ${mlp_intervention_enabled}" >&2
-        exit 2
-        ;;
-esac
-
-python_bin=${python_bin:-python3}
-"${python_bin}" -m "${trainer_module}" \
+"${python_bin}" -m recipe.mlp_channel_relative_update.main \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
     data.prompt_key=prompt \
@@ -136,8 +74,11 @@ python_bin=${python_bin:-python3}
     +actor_rollout_ref.model.override_config.resid_pdrop=0.0 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode=sync \
-    actor_rollout_ref.rollout.n=${n_total} \
+    actor_rollout_ref.rollout.n=${n_rollouts} \
     actor_rollout_ref.rollout.calculate_log_probs=True \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=False \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${log_prob_micro_batch_size_per_gpu} \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.enable_prefix_caching=True \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${tensor_model_parallel_size} \
     actor_rollout_ref.rollout.gpu_memory_utilization=${gpu_memory_utilization} \
@@ -151,29 +92,34 @@ python_bin=${python_bin:-python3}
     actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
-    actor_rollout_ref.actor.rollout_n=${n_total} \
+    actor_rollout_ref.actor.strategy=fsdp2 \
+    actor_rollout_ref.actor.rollout_n=${n_rollouts} \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
+    actor_rollout_ref.actor.optim.optimizer_impl=${optimizer_impl} \
+    actor_rollout_ref.actor.optim.optimizer=${optimizer_name} \
     actor_rollout_ref.actor.optim.lr=${lr} \
     actor_rollout_ref.actor.optim.lr_warmup_steps=${lr_warmup_steps} \
     actor_rollout_ref.actor.optim.weight_decay=0 \
     ++actor_rollout_ref.actor.force_on_policy=True \
     ++actor_rollout_ref.actor.use_rollout_log_probs=True \
+    actor_rollout_ref.actor.ppo_epochs=1 \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.loss_agg_mode=token-mean \
-    actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
+    actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=-1 \
-    actor_rollout_ref.actor.fsdp_config.param_offload=${offload} \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=${offload} \
-    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
-    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
-    actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
-    actor_rollout_ref.ref.fsdp_config.param_offload=${ref_offload} \
-    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
-    ${mlp_intervention_args[@]+"${mlp_intervention_args[@]}"} \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.actor.fsdp_config.offload_policy=False \
+    actor_rollout_ref.ref.fsdp_config.param_offload=False \
+    actor_rollout_ref.mlp_channel_relative_update.enabled=${relative_update_enabled} \
+    actor_rollout_ref.mlp_channel_relative_update.history_ema_beta=${history_ema_beta} \
+    actor_rollout_ref.mlp_channel_relative_update.history_power=${history_power} \
+    actor_rollout_ref.mlp_channel_relative_update.history_floor_ratio=${history_floor_ratio} \
+    actor_rollout_ref.mlp_channel_relative_update.multiplier_ratio_cap=${multiplier_ratio_cap} \
+    actor_rollout_ref.mlp_channel_relative_update.warmup_steps=${warmup_steps} \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     algorithm.norm_adv_by_std_in_grpo=True \
@@ -194,5 +140,6 @@ python_bin=${python_bin:-python3}
     trainer.save_freq=${test_and_save_freq} \
     trainer.total_epochs=${epoch} \
     trainer.default_local_dir="${CKPTS_DIR}" \
+    trainer.rollout_data_dir="${rollout_data_dir}" \
     trainer.resume_mode=auto \
     ++trainer.max_actor_ckpt_to_keep=1

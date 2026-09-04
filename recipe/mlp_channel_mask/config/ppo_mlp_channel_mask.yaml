@@ -12,12 +12,14 @@ actor_rollout_ref:
     n_clean: 8
     n_masked: 8
     mask_ratio: 0.10
-    selection_strategy: top_relative_activation
+    selection_strategy: soft_top
+    score_method: relative_activation
+    score_ema_beta: 0.0
     random_seed: 42
     random_scope: per_layer
     weighted_max_ratio: 4.0
     weighted_rank_power: 2.0
-    random_resample_every_step: false
+    random_resample_every_step: true
     activation_update_every_step: true
     activation_ema_beta: 0.95
     relative_activation_epsilon: 1.0e-6

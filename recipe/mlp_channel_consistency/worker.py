@@ -60,6 +60,9 @@ class MLPChannelConsistencyActorRolloutRefWorker(ActorRolloutRefWorker):
             actor_optimizer=self.actor_optimizer,
         )
         self.actor.consistency_controller = controller
+        self.actor.consistency_auxiliary_enabled = bool(
+            config.get("auxiliary_enabled", True)
+        )
         self.actor.consistency_kl_coef = float(config.get("kl_coef", 0.01))
         self.actor.consistency_kl_top_k = int(config.get("kl_top_k", 64))
         self.actor.consistency_micro_batch_size_per_gpu = int(
@@ -70,11 +73,13 @@ class MLPChannelConsistencyActorRolloutRefWorker(ActorRolloutRefWorker):
         actor_model = getattr(
             self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp
         )
-        installed = install_hf_mlp_consistency_mask(actor_model, controller)
-        if len(installed) != controller.num_layers:
-            raise RuntimeError(
-                f"installed {len(installed)} MLP masks, expected {controller.num_layers}"
-            )
+        if self.actor.consistency_auxiliary_enabled:
+            installed = install_hf_mlp_consistency_mask(actor_model, controller)
+            if len(installed) != controller.num_layers:
+                raise RuntimeError(
+                    f"installed {len(installed)} MLP masks, "
+                    f"expected {controller.num_layers}"
+                )
         if fsdp_version(self.actor.actor_module) not in {1, 2}:
             raise RuntimeError("MLP-channel consistency requires an FSDP/FSDP2 actor")
 
@@ -103,7 +108,19 @@ class MLPChannelConsistencyActorRolloutRefWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     def update_actor(self, data: DataProto):
         assert self._is_actor
-        mask_metrics = self.consistency_controller.resample()
+        if self.actor.consistency_auxiliary_enabled:
+            mask_metrics = self.consistency_controller.resample()
+        else:
+            mask_metrics = {
+                "mlp_consistency/mask_version": 0.0,
+                "mlp_consistency/mask_ratio_requested": 0.0,
+                "mlp_consistency/masked_per_layer": 0.0,
+                "mlp_consistency/masked_per_layer_min": 0.0,
+                "mlp_consistency/masked_per_layer_max": 0.0,
+                "mlp_consistency/realized_mask_fraction": 0.0,
+                "mlp_consistency/hard_mask": 0.0,
+                "mlp_consistency/inverted_dropout_scaling": 0.0,
+            }
         try:
             output = super().update_actor(data)
         finally:

@@ -89,6 +89,18 @@ cd /Users/molu/verl-mlp_channels_mask
 bash recipe/mlp_channel_consistency/grpo_mlp_channel_consistency_qwen3-4b_offline.sh
 ```
 
+完全不执行 masked forward/backward 和 auxiliary loss、但保留相同诊断指标的 matched
+clean-GRPO baseline：
+
+```bash
+cd /Users/molu/verl-mlp_channels_mask
+bash recipe/mlp_channel_consistency/baseline_grpo_qwen3-4b_offline.sh
+```
+
+baseline 强制 `auxiliary_enabled=False` 和 `kl_coef=0`。它仍记录主 loss、主梯度 RMS
+以及每次 validation 的参数更新稀疏度；所有 auxiliary loss/gradient 和 mask 指标保留
+相同 key，但值为零，因而实验组和 baseline 可以直接使用同一套 dashboard。
+
 常用覆盖：
 
 ```bash

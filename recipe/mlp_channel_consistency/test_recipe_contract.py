@@ -19,6 +19,7 @@ class MLPChannelConsistencyRecipeContractTest(unittest.TestCase):
         )
         component = config["actor_rollout_ref"]["mlp_channel_consistency"]
         self.assertTrue(component["enabled"])
+        self.assertTrue(component["auxiliary_enabled"])
         self.assertEqual(component["mask_ratio"], 0.10)
         self.assertEqual(component["kl_top_k"], 64)
         self.assertEqual(component["micro_batch_size_per_gpu"], 1)
@@ -43,6 +44,7 @@ class MLPChannelConsistencyRecipeContractTest(unittest.TestCase):
         self.assertIn('"${python_bin}" -m', launcher)
         self.assertIn("recipe.mlp_channel_consistency.main", launcher)
         self.assertIn("mask_ratio=${mask_ratio}", launcher)
+        self.assertIn("auxiliary_enabled=${auxiliary_enabled}", launcher)
         self.assertIn("kl_coef=${kl_coef}", launcher)
         self.assertIn(
             "micro_batch_size_per_gpu=${kl_micro_batch_size_per_gpu}", launcher
@@ -69,6 +71,16 @@ class MLPChannelConsistencyRecipeContractTest(unittest.TestCase):
         self.assertIn("aux_to_main_grad_ratio_sampled", (RECIPE_DIR / "diagnostics.py").read_text())
         self.assertIn("compute_parameter_update_metrics", worker_source)
         self.assertIn("compute_parameter_update_metrics", main_source)
+
+    def test_baseline_disables_auxiliary_work_but_keeps_recipe_diagnostics(self):
+        baseline = (RECIPE_DIR / "baseline_grpo_qwen3-4b_offline.sh").read_text()
+        self.assertIn("export auxiliary_enabled=False", baseline)
+        self.assertIn("export kl_coef=0", baseline)
+        self.assertIn("grpo_mlp_channel_consistency_qwen3-4b_offline.sh", baseline)
+
+        actor_source = (RECIPE_DIR / "actor.py").read_text()
+        self.assertIn("if not self.consistency_auxiliary_enabled", actor_source)
+        self.assertIn('"mlp_consistency/weighted_kl": 0.0', actor_source)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,8 @@ defaults:
 actor_rollout_ref:
   mlp_channel_consistency:
     enabled: true
+    # False gives a clean GRPO baseline while retaining all diagnostics.
+    auxiliary_enabled: true
     # Every actor optimizer step samples exactly this fraction independently in
     # every dense SwiGLU layer. Values are literal zero/one, with no rescaling.
     mask_ratio: 0.10

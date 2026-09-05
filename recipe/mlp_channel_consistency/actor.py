@@ -30,6 +30,7 @@ class MLPChannelConsistencyActor(DataParallelPPOActor):
     """
 
     consistency_controller: MLPChannelConsistencyController
+    consistency_auxiliary_enabled: bool
     consistency_kl_coef: float
     consistency_kl_top_k: int
     consistency_micro_batch_size_per_gpu: int
@@ -40,7 +41,7 @@ class MLPChannelConsistencyActor(DataParallelPPOActor):
         gradient_tracker = self.consistency_gradient_tracker
         controller.set_clean()
         gradient_tracker.start_update()
-        self._consistency_update_active = True
+        self._consistency_update_active = self.consistency_auxiliary_enabled
         self._inside_consistency_forward = False
         self._teacher_distribution: TeacherDistribution | None = None
         self._teacher_row_token_counts: tuple[int, ...] | None = None
@@ -80,6 +81,9 @@ class MLPChannelConsistencyActor(DataParallelPPOActor):
 
         metrics.setdefault("mlp_consistency/kl_coef", []).append(
             float(self.consistency_kl_coef)
+        )
+        metrics.setdefault("mlp_consistency/auxiliary_enabled", []).append(
+            float(self.consistency_auxiliary_enabled)
         )
         metrics.setdefault("mlp_consistency/kl_top_k", []).append(
             float(self.consistency_kl_top_k)
@@ -151,13 +155,28 @@ class MLPChannelConsistencyActor(DataParallelPPOActor):
         temperature: float,
         aggregation_scale: float,
     ):
-        full_teacher = self._teacher_distribution
-        if full_teacher is None:
-            raise RuntimeError("consistency backward is missing its clean teacher")
         gradient_tracker = self.consistency_gradient_tracker
         # loss.backward() has returned, so FSDP/FSDP2 has already reduced and
         # resharded the clean gradients. Sample that stable local representation.
         gradient_tracker.capture_main_gradient()
+        if not self.consistency_auxiliary_enabled:
+            # Core actor calls this hook after every clean backward. Capture the
+            # unchanged cumulative gradient a second time, which records an exact
+            # zero auxiliary vector without doing a teacher or masked forward.
+            gradient_tracker.capture_auxiliary_gradient()
+            return {
+                "mlp_consistency/kl": 0.0,
+                "mlp_consistency/weighted_kl": 0.0,
+                "mlp_consistency/response_tokens": float(
+                    model_inputs["response_mask"].detach().sum().item()
+                ),
+                "mlp_consistency/micro_batches": 0.0,
+                "timing_s/mlp_consistency_forward_backward": 0.0,
+            }
+
+        full_teacher = self._teacher_distribution
+        if full_teacher is None:
+            raise RuntimeError("consistency backward is missing its clean teacher")
         started = time.perf_counter()
         self._inside_consistency_forward = True
         self.consistency_controller.set_masked()

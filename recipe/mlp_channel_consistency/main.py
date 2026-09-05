@@ -52,6 +52,8 @@ class MLPChannelConsistencyTaskRunner:
         actor = config.actor_rollout_ref.actor
         if not bool(component.enabled):
             raise ValueError("mlp_channel_consistency.enabled must be true")
+        if not bool(component.auxiliary_enabled) and float(component.kl_coef) != 0.0:
+            raise ValueError("the no-auxiliary baseline requires kl_coef=0")
         if actor.strategy not in {"fsdp", "fsdp2"}:
             raise NotImplementedError("MLP-channel consistency requires FSDP/FSDP2")
         if config.algorithm.adv_estimator != AdvantageEstimator.GRPO:

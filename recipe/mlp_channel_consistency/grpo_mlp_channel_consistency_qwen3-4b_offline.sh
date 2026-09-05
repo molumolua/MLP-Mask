@@ -11,6 +11,7 @@ num_gpus=${num_gpus:-4}
 tensor_model_parallel_size=${tensor_model_parallel_size:-1}
 
 # Hard per-layer channel perturbation and clean -> masked KL.
+auxiliary_enabled=${auxiliary_enabled:-True}
 mask_ratio=${mask_ratio:-0.10}
 random_seed=${random_seed:-42}
 kl_coef=${kl_coef:-0.01}
@@ -112,6 +113,7 @@ python_bin=${python_bin:-python}
     actor_rollout_ref.actor.fsdp_config.offload_policy=False \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.mlp_channel_consistency.enabled=True \
+    actor_rollout_ref.mlp_channel_consistency.auxiliary_enabled=${auxiliary_enabled} \
     actor_rollout_ref.mlp_channel_consistency.mask_ratio=${mask_ratio} \
     actor_rollout_ref.mlp_channel_consistency.random_seed=${random_seed} \
     actor_rollout_ref.mlp_channel_consistency.kl_coef=${kl_coef} \

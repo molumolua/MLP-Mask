@@ -18,6 +18,7 @@ from verl.utils.fsdp_utils import fsdp_version
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
 
 from .actor import MLPChannelConsistencyActor
+from .diagnostics import ParameterUpdateTracker, SampledGradientTracker
 from .intervention import (
     MLPChannelConsistencyController,
     install_hf_mlp_consistency_mask,
@@ -76,6 +77,28 @@ class MLPChannelConsistencyActorRolloutRefWorker(ActorRolloutRefWorker):
             )
         if fsdp_version(self.actor.actor_module) not in {1, 2}:
             raise RuntimeError("MLP-channel consistency requires an FSDP/FSDP2 actor")
+
+        self.consistency_gradient_tracker = SampledGradientTracker(
+            self.actor.actor_module,
+            sample_size_per_rank=int(
+                config.get("gradient_sample_size_per_rank", 262_144)
+            ),
+            random_seed=int(config.get("random_seed", 42)) + 1_000_003 + self.rank,
+        )
+        self.actor.consistency_gradient_tracker = self.consistency_gradient_tracker
+        # Keep the pre-RL reference on CPU in BF16. Under FSDP each process stores
+        # only its local shard, and validation aggregates counts across all ranks.
+        self.parameter_update_tracker = ParameterUpdateTracker(self.actor.actor_module)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def compute_parameter_update_metrics(self):
+        if not self._is_actor:
+            return {}
+        self.consistency_controller.set_clean()
+        atol = float(
+            self._consistency_config().get("parameter_update_atol", 1.0e-5)
+        )
+        return self.parameter_update_tracker.distributed_metrics(atol=atol)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     def update_actor(self, data: DataProto):

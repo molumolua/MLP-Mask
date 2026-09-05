@@ -20,6 +20,12 @@ actor_rollout_ref:
     # KL materializes response-vocabulary logits, so it uses a smaller batch
     # than the clean GRPO branch by default.
     micro_batch_size_per_gpu: 1
+    # Fixed stratified coordinate sample used for the per-update auxiliary/main
+    # gradient RMS ratio. Memory is about 2 MiB per rank for the two FP32 vectors.
+    gradient_sample_size_per_rank: 262144
+    # Mukherjee et al.'s BF16 update-sparsity threshold. Kept fixed for direct
+    # comparison with the published metric.
+    parameter_update_atol: 1.0e-5
 
   actor:
     force_on_policy: true

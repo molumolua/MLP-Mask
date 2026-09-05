@@ -112,6 +112,19 @@ bash recipe/mlp_channel_consistency/grpo_mlp_channel_consistency_qwen3-4b_offlin
 
 - `mlp_consistency/kl`：未乘系数的 response-token mean KL；
 - `mlp_consistency/weighted_kl`：实际加入梯度的 `kl_coef * KL`；
+- `mlp_consistency/main_pg_loss_step` 与 `weighted_kl_step`：把 contribution-scaled
+  micro-batch 值求和后，本 optimizer step 的两个完整目标值；
+- `mlp_consistency/aux_to_main_loss_abs_ratio`：两个完整目标绝对值之比；loss
+  接近零时该比值会不稳定，因此调参时应以梯度比为主；
+- `mlp_consistency/main_grad_rms_sampled`：本次 optimizer step 的 clean GRPO
+  梯度在固定坐标样本上的 RMS；
+- `mlp_consistency/aux_grad_rms_sampled`：已经乘过 `kl_coef` 的一致性 KL
+  梯度 RMS；
+- `mlp_consistency/aux_to_main_grad_ratio_sampled`：上述两者之比。这是调
+  `kl_coef` 最直接的量；由于先跨全部 micro-batch 累积梯度再求比值，改变
+  `kl_micro_batch_size_per_gpu` 不会改变定义；
+- `mlp_consistency/main_aux_grad_cosine_sampled`：两个分支梯度方向的 cosine；
+- `mlp_consistency/gradient_sample_fraction|count`：估计所用的固定坐标样本；
 - `mlp_consistency/response_tokens`；
 - `mlp_consistency/micro_batches`：每个 clean micro-batch 对应的 masked KL 子批次数；
 - `mlp_consistency/mask_version`；
@@ -119,6 +132,34 @@ bash recipe/mlp_channel_consistency/grpo_mlp_channel_consistency_qwen3-4b_offlin
 - `mlp_consistency/masked_per_layer_min|max`；
 - `mlp_consistency/hard_mask=1`；
 - `mlp_consistency/inverted_dropout_scaling=0`。
+
+默认每卡固定分层抽样 262,144 个 trainable parameter 坐标，两个 FP32 梯度向量约
+占 2 MiB。跨卡汇总后得到整个 sharded actor 的 RMS 比值；这是无偏近似诊断，避免
+为精确拆分两个 loss 的全量梯度而再保存一份 4B 参数梯度。
+
+每次 validation 还会记录：
+
+- `val-aux/parameter_update/sparsity_atol_1e-5`：与 pre-RL 初始化相比仍未变化的
+  BF16 参数比例；
+- `val-aux/parameter_update/updated_fraction_atol_1e-5`：发生变化的比例，即
+  `1 - sparsity`；
+- `val-aux/parameter_update/mean_abs_delta_bfloat16` 与
+  `rms_delta_bfloat16`：BF16 参数位移的平均绝对值和 RMS；
+- `val-aux/parameter_update/parameter_count_billions` 与 `atol`：统计规模及阈值。
+
+这里复现 Mukherjee et al., *Reinforcement Learning Finetunes Small Subnetworks in
+Large Language Models* 的口径：令 pre-RL 参数为 `theta_0`、当前参数为 `theta_t`，
+`sparsity = 1 - ||theta_t - theta_0||_0 / n`；实现上先转 BF16，再用
+`torch.isclose(delta, 0, atol=1e-5)` 判为未更新。论文报告的是训练完成的 checkpoint，
+因此训练早期或中途 validation 的数值不应被要求立刻落入论文最终结果区间。
+
+- 论文：https://arxiv.org/abs/2505.11711
+- 官方实现：https://github.com/SagnikMukherjee/sparsity_in_rl/blob/main/src/check_sparsity.py
+
+pre-RL BF16 reference 在 worker 初始化时保存为每卡的 CPU FSDP shard，不保留额外
+GPU 全量模型。以 4B 模型、4-way full shard 为例，每个 actor process 约增加 2 GB
+CPU 内存（整机合计约 8 GB）。resume 时 reference 仍来自 `model.path`，所以
+`model.path` 必须保持为原始 pre-RL 模型，而不能改成已训练 checkpoint。
 
 ## 实验解释与风险
 

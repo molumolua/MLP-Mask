@@ -17,6 +17,20 @@ from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 
 
+class MLPChannelConsistencyTrainer(RayPPOTrainer):
+    """Attach pre-RL parameter-update sparsity to every validation event."""
+
+    def _validate(self):
+        metrics = super()._validate()
+        per_rank_metrics = self.actor_rollout_wg.compute_parameter_update_metrics()
+        if not per_rank_metrics:
+            raise RuntimeError("parameter-update diagnostics returned no actor metrics")
+        # The worker performs an all-reduce, so every actor rank returns the same
+        # global result. Keep one copy rather than averaging it a second time.
+        metrics.update(per_rank_metrics[0])
+        return metrics
+
+
 @hydra.main(
     config_path="config",
     config_name="ppo_mlp_channel_consistency",
@@ -89,6 +103,13 @@ class MLPChannelConsistencyTaskRunner:
             raise ValueError("micro_batch_size_per_gpu must be positive")
         if int(component.kl_top_k) < 0:
             raise ValueError("kl_top_k must be zero (full KL) or positive")
+        if int(component.gradient_sample_size_per_rank) <= 0:
+            raise ValueError("gradient_sample_size_per_rank must be positive")
+        if float(component.parameter_update_atol) != 1.0e-5:
+            raise ValueError(
+                "parameter_update_atol must remain 1e-5 to match the published "
+                "BF16 update-sparsity protocol"
+            )
 
     def run(self, config):
         from verl.single_controller.ray import RayWorkerGroup
@@ -172,7 +193,7 @@ class MLPChannelConsistencyTaskRunner:
             resource_pool_spec=resource_pool_spec,
             mapping=self.mapping,
         )
-        trainer = RayPPOTrainer(
+        trainer = MLPChannelConsistencyTrainer(
             config=config,
             tokenizer=tokenizer,
             processor=processor,

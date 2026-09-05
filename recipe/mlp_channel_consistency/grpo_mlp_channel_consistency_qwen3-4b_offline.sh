@@ -16,6 +16,7 @@ random_seed=${random_seed:-42}
 kl_coef=${kl_coef:-0.01}
 kl_top_k=${kl_top_k:-64}
 kl_micro_batch_size_per_gpu=${kl_micro_batch_size_per_gpu:-1}
+gradient_sample_size_per_rank=${gradient_sample_size_per_rank:-262144}
 
 # Standard clean GRPO budget. There is no masked rollout generation.
 n_rollouts=${n_rollouts:-16}
@@ -116,6 +117,7 @@ python_bin=${python_bin:-python}
     actor_rollout_ref.mlp_channel_consistency.kl_coef=${kl_coef} \
     actor_rollout_ref.mlp_channel_consistency.kl_top_k=${kl_top_k} \
     actor_rollout_ref.mlp_channel_consistency.micro_batch_size_per_gpu=${kl_micro_batch_size_per_gpu} \
+    actor_rollout_ref.mlp_channel_consistency.gradient_sample_size_per_rank=${gradient_sample_size_per_rank} \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     algorithm.norm_adv_by_std_in_grpo=True \

@@ -10,6 +10,7 @@ from verl import DataProto
 from verl.workers.actor.dp_actor import DataParallelPPOActor
 
 from .batching import slice_model_inputs
+from .diagnostics import SampledGradientTracker
 from .intervention import MLPChannelConsistencyController
 from .kl import (
     TeacherDistribution,
@@ -32,17 +33,22 @@ class MLPChannelConsistencyActor(DataParallelPPOActor):
     consistency_kl_coef: float
     consistency_kl_top_k: int
     consistency_micro_batch_size_per_gpu: int
+    consistency_gradient_tracker: SampledGradientTracker
 
     def update_policy(self, data: DataProto):
         controller = self.consistency_controller
+        gradient_tracker = self.consistency_gradient_tracker
         controller.set_clean()
+        gradient_tracker.start_update()
         self._consistency_update_active = True
         self._inside_consistency_forward = False
         self._teacher_distribution: TeacherDistribution | None = None
         self._teacher_row_token_counts: tuple[int, ...] | None = None
         self._student_kl_sum: torch.Tensor | None = None
+        completed = False
         try:
             metrics = super().update_policy(data)
+            completed = True
         finally:
             self._response_logits_callback = None
             self._teacher_distribution = None
@@ -51,6 +57,26 @@ class MLPChannelConsistencyActor(DataParallelPPOActor):
             self._inside_consistency_forward = False
             self._consistency_update_active = False
             controller.set_clean()
+            if not completed:
+                gradient_tracker.cancel_update()
+
+        gradient_metrics = gradient_tracker.finish_update()
+        for name, value in gradient_metrics.items():
+            metrics.setdefault(name, []).append(value)
+
+        # The existing per-micro-batch values are contribution-scaled; summing
+        # them reconstructs the two complete objectives for this optimizer step.
+        main_pg_loss = sum(float(value) for value in metrics.get("actor/pg_loss", []))
+        weighted_auxiliary_loss = sum(
+            float(value) for value in metrics.get("mlp_consistency/weighted_kl", [])
+        )
+        metrics.setdefault("mlp_consistency/main_pg_loss_step", []).append(main_pg_loss)
+        metrics.setdefault("mlp_consistency/weighted_kl_step", []).append(
+            weighted_auxiliary_loss
+        )
+        metrics.setdefault("mlp_consistency/aux_to_main_loss_abs_ratio", []).append(
+            abs(weighted_auxiliary_loss) / max(abs(main_pg_loss), 1.0e-12)
+        )
 
         metrics.setdefault("mlp_consistency/kl_coef", []).append(
             float(self.consistency_kl_coef)
@@ -128,6 +154,10 @@ class MLPChannelConsistencyActor(DataParallelPPOActor):
         full_teacher = self._teacher_distribution
         if full_teacher is None:
             raise RuntimeError("consistency backward is missing its clean teacher")
+        gradient_tracker = self.consistency_gradient_tracker
+        # loss.backward() has returned, so FSDP/FSDP2 has already reduced and
+        # resharded the clean gradients. Sample that stable local representation.
+        gradient_tracker.capture_main_gradient()
         started = time.perf_counter()
         self._inside_consistency_forward = True
         self.consistency_controller.set_masked()
@@ -168,6 +198,8 @@ class MLPChannelConsistencyActor(DataParallelPPOActor):
             self._response_logits_callback = None
             self._inside_consistency_forward = False
             self.consistency_controller.set_clean()
+
+        gradient_tracker.capture_auxiliary_gradient()
 
         raw_kl = detached_kl_sum / float(full_teacher.token_count)
         weighted_kl = (

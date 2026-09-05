@@ -1,0 +1,51 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+actor_rollout_ref:
+  mlp_channel_consistency:
+    enabled: true
+    # Every actor optimizer step samples exactly this fraction independently in
+    # every dense SwiGLU layer. Values are literal zero/one, with no rescaling.
+    mask_ratio: 0.10
+    random_seed: 42
+    kl_coef: 0.01
+    # Positive: exact KL over clean top-k tokens plus one aggregate tail bucket.
+    # Zero: full categorical KL (substantially more activation memory).
+    kl_top_k: 64
+
+  actor:
+    force_on_policy: true
+    use_rollout_log_probs: true
+    use_fused_kernels: false
+    ppo_epochs: 1
+    loss_agg_mode: token-mean
+    ulysses_sequence_parallel_size: 1
+
+  rollout:
+    name: vllm
+    mode: sync
+    n: 16
+    calculate_log_probs: true
+    log_prob_use_dynamic_bsz: false
+    log_prob_micro_batch_size_per_gpu: 1
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  rollout_correction:
+    bypass_old_logprob_for_rollout: false
+    rollout_is: null
+    rollout_rs: null
+
+reward_model:
+  reward_manager: naive
+
+trainer:
+  project_name: MLP-Channel-Consistency
+  merge_duplicate_val_prompts: true
+  validation_pass_reward_threshold: 0.0

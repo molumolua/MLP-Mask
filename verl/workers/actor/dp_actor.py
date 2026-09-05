@@ -133,9 +133,13 @@ class DataParallelPPOActor(BasePPOActor):
         """
         response_length = micro_batch["responses"].size(-1)
         intervention_controller = getattr(self, "intervention_controller", None)
+        response_logits_callback = getattr(self, "_response_logits_callback", None)
+        needs_response_layout = (
+            intervention_controller is not None or response_logits_callback is not None
+        )
         response_token_mask = None
         response_sample_ids = None
-        if intervention_controller is not None:
+        if needs_response_layout:
             # A causal LM predicts response token j from the activation at the
             # preceding sequence position.  Align activation collection with the exact logit
             # slice used below: [-response_length - 1 : -1].
@@ -168,10 +172,11 @@ class DataParallelPPOActor(BasePPOActor):
                 )  # input_ids_rmpad (total_nnz, ...)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
 
-                if intervention_controller is not None:
+                if needs_response_layout:
                     response_token_mask_rmpad = index_first_axis(
                         rearrange(response_token_mask.unsqueeze(-1), "b s ... -> (b s) ..."), indices
                     ).transpose(0, 1)
+                if intervention_controller is not None:
                     response_sample_ids_rmpad = index_first_axis(
                         rearrange(response_sample_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
                     ).transpose(0, 1)
@@ -221,12 +226,13 @@ class DataParallelPPOActor(BasePPOActor):
                         position_ids_rmpad=None,
                         sp_size=self.ulysses_sequence_parallel_size,
                     )
-                    if intervention_controller is not None:
+                    if needs_response_layout:
                         response_token_mask_rmpad, _, _ = ulysses_pad_and_slice_inputs(
                             response_token_mask_rmpad,
                             position_ids_rmpad=None,
                             sp_size=self.ulysses_sequence_parallel_size,
                         )
+                    if intervention_controller is not None:
                         response_sample_ids_rmpad, _, _ = ulysses_pad_and_slice_inputs(
                             response_sample_ids_rmpad,
                             position_ids_rmpad=None,
@@ -258,17 +264,23 @@ class DataParallelPPOActor(BasePPOActor):
                 )  # prevent model thinks we are generating
 
                 if self.use_fused_kernels:
+                    if response_logits_callback is not None:
+                        raise NotImplementedError(
+                            "response-distribution auxiliary losses require actor.use_fused_kernels=false"
+                        )
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
                     entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
 
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                     logits_rmpad.div_(temperature)
+                    if response_logits_callback is not None:
+                        response_logits_callback(logits_rmpad, response_token_mask_rmpad)
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
-                    inplace_backward = True
-                    if calculate_entropy:
-                        inplace_backward = False
+                    inplace_backward = not (
+                        calculate_entropy or response_logits_callback is not None
+                    )
                     log_probs = logprobs_from_logits(
                         logits=logits_rmpad,
                         labels=input_ids_rmpad_rolled,
@@ -342,6 +354,10 @@ class DataParallelPPOActor(BasePPOActor):
                 )  # prevent model thinks we are generating
 
                 if self.use_fused_kernels:
+                    if response_logits_callback is not None:
+                        raise NotImplementedError(
+                            "response-distribution auxiliary losses require actor.use_fused_kernels=false"
+                        )
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
                     entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
 
@@ -350,6 +366,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+                    if response_logits_callback is not None:
+                        response_logits_callback(logits, micro_batch["response_mask"])
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
@@ -850,6 +868,25 @@ class DataParallelPPOActor(BasePPOActor):
                     finally:
                         if intervention_controller is not None:
                             intervention_controller.end_batch()
+
+                    auxiliary_backward = getattr(self, "_backward_auxiliary_loss", None)
+                    if auxiliary_backward is not None:
+                        auxiliary_token_count = float(response_mask.detach().sum().item())
+                        auxiliary_global_token_count = float(
+                            mini_response_mask.detach().sum().item()
+                        )
+                        auxiliary_aggregation_scale = (
+                            auxiliary_token_count / auxiliary_global_token_count
+                            if auxiliary_global_token_count > 0.0
+                            else 0.0
+                        )
+                        auxiliary_metrics = auxiliary_backward(
+                            model_inputs=model_inputs,
+                            temperature=temperature,
+                            aggregation_scale=auxiliary_aggregation_scale,
+                        )
+                        if auxiliary_metrics:
+                            micro_batch_metrics.update(auxiliary_metrics)
 
                     if route_update_started is not None:
                         micro_batch_metrics[f"timing_s/{route_name}_actor_forward_backward"] = (

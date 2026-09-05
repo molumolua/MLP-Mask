@@ -33,13 +33,12 @@ class MLPChannelConsistencyRecipeContractTest(unittest.TestCase):
             self.assertNotIn("from recipe.", source, path.name)
             self.assertNotIn("import recipe.", source, path.name)
 
-    def test_launcher_uses_repository_python_and_recipe_entrypoint(self):
+    def test_launcher_uses_configurable_python_and_recipe_entrypoint(self):
         launcher = (
             RECIPE_DIR / "grpo_mlp_channel_consistency_qwen3-4b_offline.sh"
         ).read_text()
-        self.assertIn(
-            "/opt/homebrew/Caskroom/miniconda/base/envs/molu/bin/python", launcher
-        )
+        self.assertIn("python_bin=${python_bin:-python}", launcher)
+        self.assertIn('"${python_bin}" -m', launcher)
         self.assertIn("recipe.mlp_channel_consistency.main", launcher)
         self.assertIn("mask_ratio=${mask_ratio}", launcher)
         self.assertIn("kl_coef=${kl_coef}", launcher)

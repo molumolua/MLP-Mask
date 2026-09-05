@@ -21,6 +21,7 @@ class MLPChannelConsistencyRecipeContractTest(unittest.TestCase):
         self.assertTrue(component["enabled"])
         self.assertEqual(component["mask_ratio"], 0.10)
         self.assertEqual(component["kl_top_k"], 64)
+        self.assertEqual(component["micro_batch_size_per_gpu"], 1)
         self.assertEqual(config["actor_rollout_ref"]["rollout"]["n"], 16)
         self.assertFalse(config["algorithm"]["use_kl_in_reward"])
 
@@ -42,6 +43,9 @@ class MLPChannelConsistencyRecipeContractTest(unittest.TestCase):
         self.assertIn("recipe.mlp_channel_consistency.main", launcher)
         self.assertIn("mask_ratio=${mask_ratio}", launcher)
         self.assertIn("kl_coef=${kl_coef}", launcher)
+        self.assertIn(
+            "micro_batch_size_per_gpu=${kl_micro_batch_size_per_gpu}", launcher
+        )
 
     def test_core_actor_exposes_logits_and_auxiliary_backward_hooks(self):
         actor_source = (REPO_ROOT / "verl" / "workers" / "actor" / "dp_actor.py").read_text()

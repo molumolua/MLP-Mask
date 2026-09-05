@@ -17,6 +17,9 @@ actor_rollout_ref:
     # Positive: exact KL over clean top-k tokens plus one aggregate tail bucket.
     # Zero: full categorical KL (substantially more activation memory).
     kl_top_k: 64
+    # KL materializes response-vocabulary logits, so it uses a smaller batch
+    # than the clean GRPO branch by default.
+    micro_batch_size_per_gpu: 1
 
   actor:
     force_on_policy: true

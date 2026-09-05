@@ -9,8 +9,14 @@ import torch
 from verl import DataProto
 from verl.workers.actor.dp_actor import DataParallelPPOActor
 
+from .batching import slice_model_inputs
 from .intervention import MLPChannelConsistencyController
-from .kl import TeacherDistribution, build_teacher_distribution, forward_kl_sum
+from .kl import (
+    TeacherDistribution,
+    build_teacher_distribution,
+    forward_kl_sum,
+    slice_teacher_rows,
+)
 
 
 class MLPChannelConsistencyActor(DataParallelPPOActor):
@@ -25,6 +31,7 @@ class MLPChannelConsistencyActor(DataParallelPPOActor):
     consistency_controller: MLPChannelConsistencyController
     consistency_kl_coef: float
     consistency_kl_top_k: int
+    consistency_micro_batch_size_per_gpu: int
 
     def update_policy(self, data: DataProto):
         controller = self.consistency_controller
@@ -32,12 +39,14 @@ class MLPChannelConsistencyActor(DataParallelPPOActor):
         self._consistency_update_active = True
         self._inside_consistency_forward = False
         self._teacher_distribution: TeacherDistribution | None = None
+        self._teacher_row_token_counts: tuple[int, ...] | None = None
         self._student_kl_sum: torch.Tensor | None = None
         try:
             metrics = super().update_policy(data)
         finally:
             self._response_logits_callback = None
             self._teacher_distribution = None
+            self._teacher_row_token_counts = None
             self._student_kl_sum = None
             self._inside_consistency_forward = False
             self._consistency_update_active = False
@@ -48,6 +57,9 @@ class MLPChannelConsistencyActor(DataParallelPPOActor):
         )
         metrics.setdefault("mlp_consistency/kl_top_k", []).append(
             float(self.consistency_kl_top_k)
+        )
+        metrics.setdefault("mlp_consistency/micro_batch_size_per_gpu", []).append(
+            float(self.consistency_micro_batch_size_per_gpu)
         )
         return metrics
 
@@ -63,6 +75,14 @@ class MLPChannelConsistencyActor(DataParallelPPOActor):
 
         self.consistency_controller.set_clean()
         self._teacher_distribution = None
+        self._teacher_row_token_counts = tuple(
+            int(value)
+            for value in micro_batch["response_mask"]
+            .sum(dim=-1)
+            .detach()
+            .cpu()
+            .tolist()
+        )
         self._response_logits_callback = self._capture_teacher_distribution
         try:
             result = super()._forward_micro_batch(
@@ -83,6 +103,7 @@ class MLPChannelConsistencyActor(DataParallelPPOActor):
             logits,
             response_token_mask,
             top_k=self.consistency_kl_top_k,
+            row_token_counts=self._teacher_row_token_counts,
         )
 
     def _capture_student_kl(
@@ -104,40 +125,59 @@ class MLPChannelConsistencyActor(DataParallelPPOActor):
         temperature: float,
         aggregation_scale: float,
     ):
-        teacher = self._teacher_distribution
-        if teacher is None:
+        full_teacher = self._teacher_distribution
+        if full_teacher is None:
             raise RuntimeError("consistency backward is missing its clean teacher")
         started = time.perf_counter()
-        self._student_kl_sum = None
         self._inside_consistency_forward = True
         self.consistency_controller.set_masked()
         self._response_logits_callback = self._capture_student_kl
+        batch_size = int(model_inputs["responses"].shape[0])
+        micro_batch_size = int(self.consistency_micro_batch_size_per_gpu)
+        detached_kl_sum = 0.0
+        sub_batch_count = 0
         try:
-            # The sampled response is reused verbatim.  This is teacher forcing,
-            # not a second autoregressive rollout.
-            super()._forward_micro_batch(
-                model_inputs,
-                temperature=temperature,
-                calculate_entropy=False,
-            )
-            if self._student_kl_sum is None:
-                raise RuntimeError("masked actor forward did not produce a KL loss")
-            raw_kl = self._student_kl_sum / float(teacher.token_count)
-            weighted_kl = (
-                raw_kl
-                * float(self.consistency_kl_coef)
-                * float(aggregation_scale)
-            )
-            weighted_kl.backward()
+            for start in range(0, batch_size, micro_batch_size):
+                end = min(start + micro_batch_size, batch_size)
+                if sum(full_teacher.row_token_counts[start:end]) == 0:
+                    continue
+                self._teacher_distribution = slice_teacher_rows(full_teacher, start, end)
+                self._student_kl_sum = None
+                sub_inputs = slice_model_inputs(model_inputs, start, end, batch_size)
+
+                # Reuse the sampled response verbatim. Splitting only changes the
+                # masked teacher-forced memory schedule, not the KL objective.
+                super()._forward_micro_batch(
+                    sub_inputs,
+                    temperature=temperature,
+                    calculate_entropy=False,
+                )
+                if self._student_kl_sum is None:
+                    raise RuntimeError("masked actor forward did not produce a KL loss")
+                detached_kl_sum += float(self._student_kl_sum.detach().item())
+                weighted_sub_kl = (
+                    self._student_kl_sum
+                    / float(full_teacher.token_count)
+                    * float(self.consistency_kl_coef)
+                    * float(aggregation_scale)
+                )
+                weighted_sub_kl.backward()
+                self._student_kl_sum = None
+                sub_batch_count += 1
         finally:
             self._response_logits_callback = None
             self._inside_consistency_forward = False
             self.consistency_controller.set_clean()
 
+        raw_kl = detached_kl_sum / float(full_teacher.token_count)
+        weighted_kl = (
+            raw_kl * float(self.consistency_kl_coef) * float(aggregation_scale)
+        )
         metrics = {
-            "mlp_consistency/kl": float(raw_kl.detach().item()),
-            "mlp_consistency/weighted_kl": float(weighted_kl.detach().item()),
-            "mlp_consistency/response_tokens": float(teacher.token_count),
+            "mlp_consistency/kl": float(raw_kl),
+            "mlp_consistency/weighted_kl": float(weighted_kl),
+            "mlp_consistency/response_tokens": float(full_teacher.token_count),
+            "mlp_consistency/micro_batches": float(sub_batch_count),
             "timing_s/mlp_consistency_forward_backward": time.perf_counter()
             - started,
         }

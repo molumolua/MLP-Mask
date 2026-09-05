@@ -95,6 +95,7 @@ bash recipe/mlp_channel_consistency/grpo_mlp_channel_consistency_qwen3-4b_offlin
 mask_ratio=0.10 \
 kl_coef=0.01 \
 kl_top_k=64 \
+kl_micro_batch_size_per_gpu=1 \
 bash recipe/mlp_channel_consistency/grpo_mlp_channel_consistency_qwen3-4b_offline.sh
 ```
 
@@ -112,6 +113,7 @@ bash recipe/mlp_channel_consistency/grpo_mlp_channel_consistency_qwen3-4b_offlin
 - `mlp_consistency/kl`：未乘系数的 response-token mean KL；
 - `mlp_consistency/weighted_kl`：实际加入梯度的 `kl_coef * KL`；
 - `mlp_consistency/response_tokens`；
+- `mlp_consistency/micro_batches`：每个 clean micro-batch 对应的 masked KL 子批次数；
 - `mlp_consistency/mask_version`；
 - `mlp_consistency/realized_mask_fraction`；
 - `mlp_consistency/masked_per_layer_min|max`；
@@ -134,3 +136,8 @@ R-Drop/LR-Drop 为 dropout consistency 提供了直接先例，structured dropou
 建议第一轮至少比较 `kl_coef=0.001/0.01/0.05`，不要只跑一个系数。mask 本身不进入
 rollout，但 auxiliary pass 会增加一次 actor forward/backward；端到端开销取决于
 generation 与 actor update 的占比。
+
+`kl_micro_batch_size_per_gpu` 只控制 masked teacher-forced KL 分支，不改变 clean GRPO
+的动态 micro-batch，也不改变 loss 的 response-token mean 归一化。Qwen3-4B 的大词表
+会让 KL 分支的 response logits 占用较多显存，默认值 `1` 是面向 80GB GPU 的保守
+设置；确认显存余量后可以调大来换取吞吐。

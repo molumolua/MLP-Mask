@@ -61,6 +61,9 @@ class MLPChannelConsistencyActorRolloutRefWorker(ActorRolloutRefWorker):
         self.actor.consistency_controller = controller
         self.actor.consistency_kl_coef = float(config.get("kl_coef", 0.01))
         self.actor.consistency_kl_top_k = int(config.get("kl_top_k", 64))
+        self.actor.consistency_micro_batch_size_per_gpu = int(
+            config.get("micro_batch_size_per_gpu", 1)
+        )
         self.consistency_controller = controller
 
         actor_model = getattr(

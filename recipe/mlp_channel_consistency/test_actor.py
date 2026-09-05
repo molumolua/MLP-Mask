@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import unittest
 
+import numpy as np
 import torch
 
-from .kl import build_teacher_distribution, forward_kl_sum
+from .batching import slice_model_inputs
+from .kl import build_teacher_distribution, forward_kl_sum, slice_teacher_rows
 
 
 class MLPChannelConsistencyActorTest(unittest.TestCase):
@@ -59,6 +61,44 @@ class MLPChannelConsistencyActorTest(unittest.TestCase):
         response_mask = torch.tensor([[1, 0, 1], [0, 1, 0]], dtype=torch.bool)
         teacher = build_teacher_distribution(logits, response_mask, top_k=2)
         self.assertEqual(teacher.token_count, 3)
+
+    def test_sliced_teacher_preserves_exact_chunked_kl(self):
+        teacher_logits = torch.randn(3, 4, 7)
+        student_logits = torch.randn(3, 4, 7)
+        response_mask = torch.tensor(
+            [[1, 1, 0, 0], [1, 1, 1, 0], [1, 0, 0, 0]], dtype=torch.bool
+        )
+        teacher = build_teacher_distribution(teacher_logits, response_mask, top_k=3)
+        full_student = student_logits.clone().requires_grad_(True)
+        full = forward_kl_sum(teacher, full_student, response_mask) / teacher.token_count
+        full.backward()
+
+        chunked_student = student_logits.clone().requires_grad_(True)
+        chunked_value = 0.0
+        for row in range(3):
+            row_teacher = slice_teacher_rows(teacher, row, row + 1)
+            chunk_loss = forward_kl_sum(
+                row_teacher,
+                chunked_student[row : row + 1],
+                response_mask[row : row + 1],
+            ) / teacher.token_count
+            chunked_value += float(chunk_loss.detach().item())
+            chunk_loss.backward()
+        self.assertAlmostEqual(chunked_value, float(full.detach().item()), places=6)
+        torch.testing.assert_close(chunked_student.grad, full_student.grad)
+
+    def test_model_input_slicing_only_slices_per_example_values(self):
+        inputs = {
+            "tokens": torch.arange(12).reshape(3, 4),
+            "labels": np.asarray(["a", "b", "c"], dtype=object),
+            "shared": torch.tensor(2.0),
+            "constant": "keep",
+        }
+        sliced = slice_model_inputs(inputs, 1, 3, 3)
+        torch.testing.assert_close(sliced["tokens"], inputs["tokens"][1:3])
+        self.assertEqual(sliced["labels"].tolist(), ["b", "c"])
+        self.assertIs(sliced["shared"], inputs["shared"])
+        self.assertEqual(sliced["constant"], "keep")
 
 
 if __name__ == "__main__":

@@ -85,6 +85,8 @@ class MLPChannelConsistencyTaskRunner:
             raise ValueError("mask_ratio must be in (0, 1)")
         if float(component.kl_coef) < 0.0:
             raise ValueError("kl_coef must be non-negative")
+        if int(component.micro_batch_size_per_gpu) <= 0:
+            raise ValueError("micro_batch_size_per_gpu must be positive")
         if int(component.kl_top_k) < 0:
             raise ValueError("kl_top_k must be zero (full KL) or positive")
 

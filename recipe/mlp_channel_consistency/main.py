@@ -16,6 +16,17 @@ from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 
+from .intervention import (
+    GRADIENT_ACTIVATION_SCORE,
+    HARD_TOP_SELECTION,
+    NO_SCORE,
+    OUTPUT_CONTRIBUTION_SCORE,
+    RANDOM_SELECTION,
+    RELATIVE_ACTIVATION_SCORE,
+    SOFT_TOP_SELECTION,
+    UPDATED_FRACTION_SCORE,
+)
+
 
 class MLPChannelConsistencyTrainer(RayPPOTrainer):
     """Attach pre-RL parameter-update sparsity to every validation event."""
@@ -99,6 +110,51 @@ class MLPChannelConsistencyTaskRunner:
             )
         if not 0.0 < float(component.mask_ratio) < 1.0:
             raise ValueError("mask_ratio must be in (0, 1)")
+        selection_strategy = str(component.selection_strategy)
+        score_method = str(component.score_method)
+        if selection_strategy not in {
+            RANDOM_SELECTION,
+            SOFT_TOP_SELECTION,
+            HARD_TOP_SELECTION,
+        }:
+            raise ValueError(f"unsupported selection_strategy={selection_strategy!r}")
+        if score_method not in {
+            NO_SCORE,
+            RELATIVE_ACTIVATION_SCORE,
+            OUTPUT_CONTRIBUTION_SCORE,
+            GRADIENT_ACTIVATION_SCORE,
+            UPDATED_FRACTION_SCORE,
+        }:
+            raise ValueError(f"unsupported score_method={score_method!r}")
+        if selection_strategy == RANDOM_SELECTION and score_method != NO_SCORE:
+            raise ValueError("selection_strategy=random requires score_method=none")
+        if selection_strategy != RANDOM_SELECTION and score_method == NO_SCORE:
+            raise ValueError("soft_top/hard_top selection requires a channel score")
+        if not bool(component.auxiliary_enabled) and selection_strategy != RANDOM_SELECTION:
+            raise ValueError(
+                "the no-auxiliary baseline requires random selection and score_method=none"
+            )
+        if score_method == UPDATED_FRACTION_SCORE:
+            if actor.strategy != "fsdp2":
+                raise NotImplementedError(
+                    "updated_fraction channel scoring requires FSDP2 logical "
+                    "parameter shapes"
+                )
+            if not bool(component.parameter_update_diagnostics_enabled):
+                raise ValueError(
+                    "updated_fraction scoring requires "
+                    "parameter_update_diagnostics_enabled=true"
+                )
+        if not 0.0 <= float(component.score_ema_beta) < 1.0:
+            raise ValueError("score_ema_beta must be in [0, 1)")
+        if not 0.0 <= float(component.activation_ema_beta) < 1.0:
+            raise ValueError("activation_ema_beta must be in [0, 1)")
+        if float(component.relative_activation_epsilon) <= 0.0:
+            raise ValueError("relative_activation_epsilon must be positive")
+        if float(component.weighted_max_ratio) < 1.0:
+            raise ValueError("weighted_max_ratio must be >= 1")
+        if float(component.weighted_rank_power) <= 0.0:
+            raise ValueError("weighted_rank_power must be positive")
         if float(component.kl_coef) < 0.0:
             raise ValueError("kl_coef must be non-negative")
         if int(component.micro_batch_size_per_gpu) <= 0:

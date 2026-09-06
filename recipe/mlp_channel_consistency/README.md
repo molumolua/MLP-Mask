@@ -59,11 +59,50 @@ z_masked = keep_mask * z
 keep_mask in {0, 1}
 ```
 
-每层独立、无放回采样恰好 `round(mask_ratio * d_ff)` 个 channel。默认每个 optimizer
-step 重采样，每个 actor data-parallel rank 由相同的 `random_seed + mask_version`
-确定性地产生相同 mask。没有 `1 / (1-p)` inverted-dropout scaling。
+每层始终选择恰好 `round(mask_ratio * d_ff)` 个 channel。默认的
+`selection_strategy=random, score_method=none` 保留原来的均匀无放回抽样；也可以用
+上一 optimizer step 的 clean GRPO 信号选择下一步的 mask。每个 actor data-parallel
+rank 对统计量做 all-reduce，并由相同的 `random_seed + mask_version` 确定性地产生相同
+mask。没有 `1 / (1-p)` inverted-dropout scaling。
 
 mask 不安装到 vLLM，因而 generation 和 validation 永远不会意外进入 masked route。
+
+## Channel score 与选择规则
+
+从 `mlp_channel_mask` 提取了三种不增加模型 pass 的 response-conditioned score：
+
+- `relative_activation`：先计算每个样本 response token 上的 `RMS(z_j)`，再和历史
+  clean-policy EMA 比较 `(current - ema) / max(ema, eps)`。它偏向最近变得异常活跃、
+  可能正在发生功能漂移的 channel；第一次 update 只建立 baseline。
+- `output_contribution`：`RMS(z_j) * ||W_down[:, j]||_2`。它同时考虑 activation 大小
+  和 channel 写回 residual stream 的尺度，最贴近“移除后 clean 分布会明显改变”的
+  consistency 初衷，建议作为第一选择。
+- `gradient_activation`：clean GRPO backward 上的
+  `mean_response |z_j * dL_grpo/dz_j|`。它是当前 RL objective 的一阶 task-conditioned
+  importance；比前两者多一些逐 token FP32 hook/reduction 工作，但仍没有额外 forward、
+  backward、rollout 或模型切换。
+
+另外支持一个直接的 parameter-update score：
+
+- `updated_fraction`：第 `l` 层第 `c` 个 channel 定义为
+  `concat(gate_proj[c,:], up_proj[c,:], down_proj[:,c])`，统计其中相对 pre-RL BF16
+  reference 满足 `|delta| > atol` 的坐标比例。比例越高，越容易被 consistency mask。
+  它在 optimizer step 后扫描当前 MLP shard，要求 FSDP2 和
+  `parameter_update_diagnostics_enabled=true`。
+
+选择规则与 score 独立：
+
+- `soft_top`（推荐）：把每层 score percentile rank 映射到
+  `1 + (weighted_max_ratio - 1) * rank ** weighted_rank_power`，再按权重精确无放回抽样。
+  默认权重范围 `[1, 4]`，既集中到重要 channel，也持续覆盖其它 channel。
+- `hard_top`：每层确定性 mask score 最大的 channel，适合作为强干预 ablation；它容易
+  长期重复打击少量 channel，不建议作为唯一主实验。
+- `random`：原始均匀 baseline，必须配 `score_method=none`。
+
+activation score 在 step `t` 的 clean GRPO backward 中顺手收集；`updated_fraction`
+在 step `t` 的 optimizer step 后计算。两者都到 step `t+1` 才用于选 mask，因此一个
+optimizer step 内的所有 auxiliary micro-batch 始终共享同一个固定 mask，不会产生
+“一边收集一边改 mask”的目标漂移。score state 与当前 mask 一起进入 checkpoint。
 
 ## KL 实现
 
@@ -111,6 +150,22 @@ kl_micro_batch_size_per_gpu=1 \
 bash recipe/mlp_channel_consistency/grpo_mlp_channel_consistency_qwen3-4b_offline.sh
 ```
 
+四个 score-aware 入口：
+
+```bash
+bash recipe/mlp_channel_consistency/grpo_mlp_channel_consistency_qwen3-4b_output_contribution_soft_top_offline.sh
+bash recipe/mlp_channel_consistency/grpo_mlp_channel_consistency_qwen3-4b_gradient_activation_soft_top_offline.sh
+bash recipe/mlp_channel_consistency/grpo_mlp_channel_consistency_qwen3-4b_relative_activation_soft_top_offline.sh
+bash recipe/mlp_channel_consistency/grpo_mlp_channel_consistency_qwen3-4b_updated_fraction_soft_top_offline.sh
+```
+
+也可以直接覆盖；例如把 soft sampling 改为 deterministic top-k：
+
+```bash
+selection_strategy=hard_top score_method=output_contribution \
+bash recipe/mlp_channel_consistency/grpo_mlp_channel_consistency_qwen3-4b_offline.sh
+```
+
 模型和数据路径也可覆盖：
 
 ```bash
@@ -142,6 +197,13 @@ bash recipe/mlp_channel_consistency/grpo_mlp_channel_consistency_qwen3-4b_offlin
 - `mlp_consistency/mask_version`；
 - `mlp_consistency/realized_mask_fraction`；
 - `mlp_consistency/masked_per_layer_min|max`；
+- `mlp_consistency/selection_is_random|soft_top|hard_top`；
+- `mlp_consistency/selection_used_score`：warmup/fallback random 时为 0；
+- `mlp_consistency/selected_rank_mean`：soft-top 实际抽中 channel 的平均 percentile rank；
+- `mlp_consistency/score_current_mean|min|max` 与 `score_initialized|updated`；
+- `mlp_consistency/score_is_relative_activation|output_contribution|gradient_activation|updated_fraction`；
+- `mlp_consistency/updated_fraction_atol`；
+- `timing_s/mlp_consistency_updated_fraction`：逐 step MLP 参数搬运、比较与汇总耗时；
 - `mlp_consistency/hard_mask=1`；
 - `mlp_consistency/inverted_dropout_scaling=0`。
 
@@ -172,6 +234,40 @@ pre-RL BF16 reference 在 worker 初始化时保存为每卡的 CPU FSDP shard�
 GPU 全量模型。以 4B 模型、4-way full shard 为例，每个 actor process 约增加 2 GB
 CPU 内存（整机合计约 8 GB）。resume 时 reference 仍来自 `model.path`，所以
 `model.path` 必须保持为原始 pre-RL 模型，而不能改成已训练 checkpoint。
+如果只需要新的 online channel score、不需要复现该全局诊断，可以显式关闭这份
+reference 及 validation 扫描：
+
+```bash
+parameter_update_diagnostics_enabled=False \
+bash recipe/mlp_channel_consistency/grpo_mlp_channel_consistency_qwen3-4b_output_contribution_soft_top_offline.sh
+```
+
+### updated_fraction 选权的实现与代价
+
+`score_method=updated_fraction` 已把原来的全局 validation 指标拆成逐 layer/channel
+统计。它复用同一份 pre-RL BF16 CPU reference；每个 optimizer step 后只遍历三组 MLP
+projection，把当前 local shard 搬到 CPU，按 channel 累加 changed/total counts，再跨
+FSDP rank all-reduce `[2, num_layers, d_ff]` 统计量。它不载入第二个模型，不切换
+actor/vLLM route，也不增加 rollout、forward 或 backward。
+
+主要代价是：常驻 CPU reference 仍接近每 rank 一份 BF16 FSDP shard；此外每 step
+都要传输并比较 MLP 参数，而不再只是 validation 时低频扫描。因此这个入口强制 FSDP2
+和 `parameter_update_diagnostics_enabled=true`。建议先测量
+`timing_s/update_actor` 与 step wall time，再决定是否降低使用频率；当前实现为了语义直接，
+每 step 更新一次。
+
+还要注意它是相对 pre-RL 的 cumulative binary coverage：训练后期可能逐渐接近 1、降低
+channel 间区分度。`gradient_activation` 更便宜且反映当前 objective；
+`updated_fraction` 更直接反映“RL 到目前为止主要改动了哪些 channel”，两者回答的问题
+不同。
+
+仓库现有 `recipe/mlp_channel_relative_update` 还提供了一个更直接的候选：它在自定义
+FSDP2 AdamW 内按 `gate_proj` row、`up_proj` row、`down_proj` column 汇总每个 channel
+的 AdamW-preconditioned relative update energy。复用这套统计不需要 CPU pre-RL 模型，
+也不需要额外 forward/backward；代价是必须接管 optimizer step、遍历 MLP update 并
+all-reduce 一个 `[num_layers, d_ff]` 张量。若做下一阶段，建议新增一个“只记录、不改变
+update”的 optimizer 模式，再把前一步 relative-update EMA 喂给 consistency，而不是
+把会随训练逐渐饱和的二值 cumulative `updated_fraction` 当作唯一权重。
 
 ## 实验解释与风险
 

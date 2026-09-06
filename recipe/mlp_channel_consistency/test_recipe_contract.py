@@ -21,9 +21,14 @@ class MLPChannelConsistencyRecipeContractTest(unittest.TestCase):
         self.assertTrue(component["enabled"])
         self.assertTrue(component["auxiliary_enabled"])
         self.assertEqual(component["mask_ratio"], 0.10)
+        self.assertEqual(component["selection_strategy"], "random")
+        self.assertEqual(component["score_method"], "none")
+        self.assertEqual(component["weighted_max_ratio"], 4.0)
+        self.assertEqual(component["weighted_rank_power"], 2.0)
         self.assertEqual(component["kl_top_k"], 64)
         self.assertEqual(component["micro_batch_size_per_gpu"], 1)
         self.assertEqual(component["gradient_sample_size_per_rank"], 262144)
+        self.assertTrue(component["parameter_update_diagnostics_enabled"])
         self.assertEqual(component["parameter_update_atol"], 1.0e-5)
         self.assertEqual(config["actor_rollout_ref"]["rollout"]["n"], 16)
         self.assertFalse(config["algorithm"]["use_kl_in_reward"])
@@ -44,6 +49,9 @@ class MLPChannelConsistencyRecipeContractTest(unittest.TestCase):
         self.assertIn('"${python_bin}" -m', launcher)
         self.assertIn("recipe.mlp_channel_consistency.main", launcher)
         self.assertIn("mask_ratio=${mask_ratio}", launcher)
+        self.assertIn("selection_strategy=${selection_strategy}", launcher)
+        self.assertIn("score_method=${score_method}", launcher)
+        self.assertIn("weighted_max_ratio=${weighted_max_ratio}", launcher)
         self.assertIn("auxiliary_enabled=${auxiliary_enabled}", launcher)
         self.assertIn("kl_coef=${kl_coef}", launcher)
         self.assertIn(
@@ -51,6 +59,10 @@ class MLPChannelConsistencyRecipeContractTest(unittest.TestCase):
         )
         self.assertIn(
             "gradient_sample_size_per_rank=${gradient_sample_size_per_rank}",
+            launcher,
+        )
+        self.assertIn(
+            "parameter_update_diagnostics_enabled=${parameter_update_diagnostics_enabled}",
             launcher,
         )
 
@@ -62,6 +74,20 @@ class MLPChannelConsistencyRecipeContractTest(unittest.TestCase):
             actor_source.index("loss.backward()"),
             actor_source.index("auxiliary_backward = getattr"),
         )
+        self.assertIn('getattr(\n            self, "_response_activation_controller"', actor_source)
+
+    def test_score_aware_launchers_use_soft_top_without_extra_model_passes(self):
+        variants = {
+            "relative_activation": "grpo_mlp_channel_consistency_qwen3-4b_relative_activation_soft_top_offline.sh",
+            "output_contribution": "grpo_mlp_channel_consistency_qwen3-4b_output_contribution_soft_top_offline.sh",
+            "gradient_activation": "grpo_mlp_channel_consistency_qwen3-4b_gradient_activation_soft_top_offline.sh",
+            "updated_fraction": "grpo_mlp_channel_consistency_qwen3-4b_updated_fraction_soft_top_offline.sh",
+        }
+        for score_method, filename in variants.items():
+            launcher = (RECIPE_DIR / filename).read_text()
+            self.assertIn("selection_strategy=${selection_strategy:-soft_top}", launcher)
+            self.assertIn(f"score_method=${{score_method:-{score_method}}}", launcher)
+            self.assertIn("grpo_mlp_channel_consistency_qwen3-4b_offline.sh", launcher)
 
     def test_recipe_records_loss_gradient_and_validation_update_ratios(self):
         actor_source = (RECIPE_DIR / "actor.py").read_text()

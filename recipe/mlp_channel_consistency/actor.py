@@ -40,8 +40,14 @@ class MLPChannelConsistencyActor(DataParallelPPOActor):
         controller = self.consistency_controller
         gradient_tracker = self.consistency_gradient_tracker
         controller.set_clean()
+        controller.start_score_collection()
         gradient_tracker.start_update()
         self._consistency_update_active = self.consistency_auxiliary_enabled
+        self._response_activation_controller = (
+            controller
+            if self.consistency_auxiliary_enabled and controller.needs_forward_score
+            else None
+        )
         self._inside_consistency_forward = False
         self._teacher_distribution: TeacherDistribution | None = None
         self._teacher_row_token_counts: tuple[int, ...] | None = None
@@ -57,11 +63,21 @@ class MLPChannelConsistencyActor(DataParallelPPOActor):
             self._student_kl_sum = None
             self._inside_consistency_forward = False
             self._consistency_update_active = False
+            self._response_activation_controller = None
             controller.set_clean()
             if not completed:
+                controller.cancel_score_collection()
                 gradient_tracker.cancel_update()
 
+        try:
+            score_metrics = controller.finish_score_collection()
+        except Exception:
+            controller.cancel_score_collection()
+            gradient_tracker.cancel_update()
+            raise
         gradient_metrics = gradient_tracker.finish_update()
+        for name, value in score_metrics.items():
+            metrics.setdefault(name, []).append(value)
         for name, value in gradient_metrics.items():
             metrics.setdefault(name, []).append(value)
 
@@ -159,6 +175,9 @@ class MLPChannelConsistencyActor(DataParallelPPOActor):
         # loss.backward() has returned, so FSDP/FSDP2 has already reduced and
         # resharded the clean gradients. Sample that stable local representation.
         gradient_tracker.capture_main_gradient()
+        # Score hooks have also completed. Drop the clean response-layout tensors
+        # before the masked teacher-forced sub-batches begin.
+        self.consistency_controller.end_batch()
         if not self.consistency_auxiliary_enabled:
             # Core actor calls this hook after every clean backward. Capture the
             # unchanged cumulative gradient a second time, which records an exact
@@ -216,6 +235,7 @@ class MLPChannelConsistencyActor(DataParallelPPOActor):
         finally:
             self._response_logits_callback = None
             self._inside_consistency_forward = False
+            self.consistency_controller.end_batch()
             self.consistency_controller.set_clean()
 
         gradient_tracker.capture_auxiliary_gradient()

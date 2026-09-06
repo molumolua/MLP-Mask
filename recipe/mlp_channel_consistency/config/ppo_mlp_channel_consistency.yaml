@@ -14,6 +14,19 @@ actor_rollout_ref:
     # Every actor optimizer step samples exactly this fraction independently in
     # every dense SwiGLU layer. Values are literal zero/one, with no rescaling.
     mask_ratio: 0.10
+    # random+none preserves the original recipe. For score-aware masks, use
+    # soft_top (recommended) or hard_top with a configured score method.
+    selection_strategy: random
+    score_method: none
+    # Activation scores consume the preceding clean GRPO backward;
+    # updated_fraction scans parameters after the preceding optimizer step.
+    score_ema_beta: 0.0
+    activation_ema_beta: 0.95
+    relative_activation_epsilon: 1.0e-6
+    # soft_top maps within-layer score ranks to [1, weighted_max_ratio] before
+    # exact weighted sampling without replacement.
+    weighted_max_ratio: 4.0
+    weighted_rank_power: 2.0
     random_seed: 42
     kl_coef: 0.01
     # Positive: exact KL over clean top-k tokens plus one aggregate tail bucket.
@@ -27,6 +40,8 @@ actor_rollout_ref:
     gradient_sample_size_per_rank: 262144
     # Mukherjee et al.'s BF16 update-sparsity threshold. Kept fixed for direct
     # comparison with the published metric.
+    # Set diagnostics_enabled=false to avoid the per-rank CPU BF16 reference.
+    parameter_update_diagnostics_enabled: true
     parameter_update_atol: 1.0e-5
 
   actor:

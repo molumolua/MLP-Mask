@@ -4,14 +4,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import re
 
 import torch
 import torch.distributed as dist
 
 try:
-    from torch.distributed.tensor import DTensor
+    from torch.distributed.tensor import DTensor, Shard
 except ImportError:  # pragma: no cover - older PyTorch fallback
     DTensor = ()
+    Shard = ()
+
+
+_MLP_WEIGHT_RE = re.compile(
+    r"(?:^|\.)(?:layers|h)\.(\d+)\.mlp\."
+    r"(gate_proj|up_proj|down_proj)\.weight$"
+)
 
 
 def _local_tensor(value: torch.Tensor) -> torch.Tensor:
@@ -219,22 +227,61 @@ class SampledGradientTracker:
 
 
 @dataclass
+class _ChannelParameterLayout:
+    layer_idx: int
+    projection: str
+    channel_axis: int
+    global_shape: tuple[int, int]
+    local_channel_start: int
+
+
+@dataclass
 class _ParameterSnapshot:
     name: str
     parameter: torch.nn.Parameter
     initial_bfloat16_cpu: torch.Tensor
+    channel_layout: _ChannelParameterLayout | None = None
 
 
 class ParameterUpdateTracker:
     """Compare current shards with the pre-RL BF16 parameters on validation."""
 
-    def __init__(self, module: torch.nn.Module) -> None:
+    def __init__(
+        self,
+        module: torch.nn.Module,
+        *,
+        num_layers: int | None = None,
+        intermediate_size: int | None = None,
+    ) -> None:
+        if (num_layers is None) != (intermediate_size is None):
+            raise ValueError(
+                "num_layers and intermediate_size must be provided together"
+            )
+        if num_layers is not None and (
+            int(num_layers) <= 0 or int(intermediate_size) <= 0
+        ):
+            raise ValueError("channel tracking dimensions must be positive")
+        self.channel_shape = (
+            None
+            if num_layers is None
+            else (int(num_layers), int(intermediate_size))
+        )
         self.snapshots: list[_ParameterSnapshot] = []
+        found_projections: dict[int, set[str]] = (
+            {}
+            if self.channel_shape is None
+            else {layer_idx: set() for layer_idx in range(self.channel_shape[0])}
+        )
         with torch.no_grad():
             for name, parameter in module.named_parameters():
                 local_parameter = _local_tensor(parameter.detach())
                 if local_parameter.numel() == 0:
                     continue
+                channel_layout = self._channel_layout(name, parameter)
+                if channel_layout is not None:
+                    found_projections[channel_layout.layer_idx].add(
+                        channel_layout.projection
+                    )
                 self.snapshots.append(
                     _ParameterSnapshot(
                         name=name,
@@ -242,10 +289,95 @@ class ParameterUpdateTracker:
                         initial_bfloat16_cpu=local_parameter.to(
                             device="cpu", dtype=torch.bfloat16
                         ).clone(),
+                        channel_layout=channel_layout,
                     )
                 )
         if not self.snapshots:
             raise RuntimeError("parameter-update diagnostics found no model parameters")
+        if self.channel_shape is not None:
+            required = {"gate_proj", "up_proj", "down_proj"}
+            incomplete = {
+                layer_idx: sorted(required - projections)
+                for layer_idx, projections in found_projections.items()
+                if projections != required
+            }
+            if incomplete:
+                raise RuntimeError(
+                    "could not resolve complete dense SwiGLU channel parameters; "
+                    f"missing projections by layer: {incomplete}"
+                )
+
+    def _channel_layout(
+        self, name: str, parameter: torch.nn.Parameter
+    ) -> _ChannelParameterLayout | None:
+        if self.channel_shape is None:
+            return None
+        normalized_name = ".".join(
+            part for part in name.split(".") if part != "_fsdp_wrapped_module"
+        )
+        match = _MLP_WEIGHT_RE.search(normalized_name)
+        if match is None:
+            return None
+        layer_idx = int(match.group(1))
+        projection = match.group(2)
+        num_layers, intermediate_size = self.channel_shape
+        if not 0 <= layer_idx < num_layers:
+            raise RuntimeError(
+                f"MLP parameter {name!r} resolves to layer {layer_idx}, "
+                f"outside [0, {num_layers})"
+            )
+        if parameter.ndim != 2:
+            raise RuntimeError(
+                f"MLP parameter {name!r} must remain logically 2-D under FSDP2"
+            )
+        global_shape = tuple(int(dim) for dim in parameter.shape)
+        channel_axis = 0 if projection in {"gate_proj", "up_proj"} else 1
+        if global_shape[channel_axis] != intermediate_size:
+            raise RuntimeError(
+                f"MLP parameter {name!r} channel dimension "
+                f"{global_shape[channel_axis]} != {intermediate_size}"
+            )
+        return _ChannelParameterLayout(
+            layer_idx=layer_idx,
+            projection=projection,
+            channel_axis=channel_axis,
+            global_shape=global_shape,
+            local_channel_start=self._local_channel_start(
+                parameter,
+                channel_axis=channel_axis,
+                global_shape=global_shape,
+            ),
+        )
+
+    @staticmethod
+    def _local_channel_start(
+        parameter: torch.Tensor,
+        *,
+        channel_axis: int,
+        global_shape: tuple[int, int],
+    ) -> int:
+        if not DTensor or not isinstance(parameter, DTensor):
+            return 0
+        sharded_placements = [
+            (mesh_dim, placement)
+            for mesh_dim, placement in enumerate(parameter.placements)
+            if isinstance(placement, Shard)
+        ]
+        if len(sharded_placements) > 1:
+            raise NotImplementedError(
+                "updated_fraction supports at most one FSDP2 Shard placement"
+            )
+        if not sharded_placements:
+            return 0
+        mesh_dim, placement = sharded_placements[0]
+        if int(placement.dim) != channel_axis:
+            return 0
+        mesh_size = int(parameter.device_mesh.size(mesh_dim))
+        mesh_rank = int(parameter.device_mesh.get_local_rank(mesh_dim))
+        _, offset = Shard.local_shard_size_and_offset(
+            global_shape[channel_axis], mesh_size, mesh_rank
+        )
+        return int(offset)
 
     @torch.no_grad()
     def local_statistics(self, *, atol: float) -> tuple[float, float, float, float]:
@@ -286,6 +418,65 @@ class ParameterUpdateTracker:
             reference_device,
         )
         return self.metrics_from_global_statistics(global_statistics, atol=atol)
+
+    @torch.no_grad()
+    def local_channel_statistics(
+        self, *, atol: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Count pre-RL-updated BF16 coordinates for each complete MLP channel."""
+        if self.channel_shape is None:
+            raise RuntimeError("parameter tracker was not configured for channels")
+        if atol < 0.0:
+            raise ValueError("parameter update atol must be non-negative")
+        updated = torch.zeros(self.channel_shape, dtype=torch.float64)
+        total = torch.zeros_like(updated)
+        zero = torch.zeros((), dtype=torch.bfloat16)
+        for snapshot in self.snapshots:
+            layout = snapshot.channel_layout
+            if layout is None:
+                continue
+            current = _local_tensor(snapshot.parameter.detach()).to(
+                device="cpu", dtype=torch.bfloat16
+            )
+            if current.shape != snapshot.initial_bfloat16_cpu.shape:
+                raise RuntimeError(
+                    f"parameter shard for {snapshot.name!r} changed shape"
+                )
+            delta = current - snapshot.initial_bfloat16_cpu
+            changed = ~torch.isclose(delta, zero, atol=float(atol))
+            reduction_axis = 1 - layout.channel_axis
+            local_updated = changed.sum(dim=reduction_axis).to(torch.float64)
+            local_channel_count = int(current.shape[layout.channel_axis])
+            start = layout.local_channel_start
+            stop = start + local_channel_count
+            if stop > self.channel_shape[1]:
+                raise RuntimeError(
+                    f"local channel range [{start}, {stop}) exceeds "
+                    f"intermediate_size={self.channel_shape[1]}"
+                )
+            updated[layout.layer_idx, start:stop].add_(local_updated)
+            total[layout.layer_idx, start:stop].add_(
+                float(current.shape[reduction_axis])
+            )
+        return updated, total
+
+    def distributed_channel_updated_fraction(
+        self, *, atol: float
+    ) -> torch.Tensor:
+        """Return globally reduced cumulative updated_fraction per MLP channel."""
+        local_updated, local_total = self.local_channel_statistics(atol=atol)
+        reference_device = _local_tensor(self.snapshots[0].parameter.detach()).device
+        collective_device = _collective_device(reference_device)
+        statistics = torch.stack((local_updated, local_total)).to(collective_device)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(statistics, op=dist.ReduceOp.SUM)
+        updated, total = statistics.cpu()
+        if bool((total <= 0).any().item()):
+            missing = int((total <= 0).sum().item())
+            raise RuntimeError(
+                f"updated_fraction counted no parameters for {missing} channels"
+            )
+        return (updated / total).to(torch.float32)
 
     @staticmethod
     def metrics_from_global_statistics(

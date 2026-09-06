@@ -111,6 +111,42 @@ class ParameterUpdateTrackerTest(unittest.TestCase):
         )
         self.assertEqual(metrics["val-aux/parameter_update/atol"], 1.0e-5)
 
+    def test_computes_updated_fraction_for_complete_swiglu_channels(self):
+        class ToyMLP(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate_proj = torch.nn.Linear(2, 3, bias=False, dtype=torch.bfloat16)
+                self.up_proj = torch.nn.Linear(2, 3, bias=False, dtype=torch.bfloat16)
+                self.down_proj = torch.nn.Linear(3, 2, bias=False, dtype=torch.bfloat16)
+
+        class ToyBlock(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mlp = ToyMLP()
+
+        class ToyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleList([ToyBlock()])
+
+        model = ToyModel()
+        with torch.no_grad():
+            for parameter in model.parameters():
+                parameter.zero_()
+        tracker = ParameterUpdateTracker(
+            model,
+            num_layers=1,
+            intermediate_size=3,
+        )
+        with torch.no_grad():
+            model.layers[0].mlp.gate_proj.weight[1].fill_(2.0e-5)
+            model.layers[0].mlp.up_proj.weight[1].fill_(2.0e-5)
+            model.layers[0].mlp.down_proj.weight[:, 1].fill_(2.0e-5)
+
+        fraction = tracker.distributed_channel_updated_fraction(atol=1.0e-5)
+
+        torch.testing.assert_close(fraction, torch.tensor([[0.0, 1.0, 0.0]]))
+
 
 if __name__ == "__main__":
     unittest.main()

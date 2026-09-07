@@ -1,0 +1,46 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+actor_rollout_ref:
+  mlp_channel_antithetic:
+    enabled: true
+    # Positive route: 1 + sigma * epsilon; negative: 1 - sigma * epsilon.
+    perturbation_strength: 0.10
+    random_seed: 42
+    refresh_every_step: true
+
+  actor:
+    # One update over the complete paired batch, using route-correct behavior probs.
+    force_on_policy: true
+    use_rollout_log_probs: true
+
+  rollout:
+    name: vllm
+    mode: sync
+    n: 16
+    calculate_log_probs: true
+    enable_prefix_caching: true
+    data_parallel_size: 1
+    pipeline_model_parallel_size: 1
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  rollout_correction:
+    bypass_old_logprob_for_rollout: false
+    rollout_is: null
+    rollout_rs: null
+
+reward_model:
+  reward_manager: naive
+
+trainer:
+  project_name: MLP-Channel-Antithetic
+  balance_batch: true
+  merge_duplicate_val_prompts: true
+  validation_pass_reward_threshold: 0.0

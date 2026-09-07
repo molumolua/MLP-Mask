@@ -7,6 +7,7 @@ The recipe directories correspond to different generations or controls of the me
 | [`denoise`](./denoise) | Legacy v1 | Fixed-noise DenoiseRL. It mixes standard and noisy-prefix rollouts and uses a fixed or globally sampled prefix ratio. Kept for reproducing the older implementation. |
 | [`denoise_v2`](./denoise_v2) | **Primary** | Current DenoiseRL: recovery-only rollout groups, per-problem adaptive `rho`, line-aligned prefixes, continuation-only loss, and stable-sample replacement. |
 | [`correct_prefix`](./correct_prefix) | Control | Positive-prefix baseline built from verified-correct weak-model trajectories. |
+| [`mlp_channel_antithetic`](./mlp_channel_antithetic) | Experimental | Budget-matched positive/negative MLP-channel gain perturbations with a shared GRPO prompt group and neutral validation. |
 
 `denoise_v3` was an experimental branch and has been removed. It is not part of the current method.
 

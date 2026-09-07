@@ -448,6 +448,15 @@ class DataParallelPPOActor(BasePPOActor):
                 raise RuntimeError("MLP intervention log-prob batch is missing response_mask")
             if "route_id" not in data.non_tensor_batch:
                 raise RuntimeError("MLP intervention log-prob batch is missing route_id")
+            version_field = getattr(intervention_controller, "batch_version_field", None)
+            if version_field is not None:
+                if version_field not in data.non_tensor_batch:
+                    raise RuntimeError(
+                        f"MLP intervention log-prob batch is missing {version_field}"
+                    )
+                intervention_controller.validate_batch_version(
+                    data.non_tensor_batch[version_field]
+                )
             select_keys.append("response_mask")
             non_tensor_select_keys.append("route_id")
 
@@ -459,12 +468,20 @@ class DataParallelPPOActor(BasePPOActor):
             # dynamic micro-batches independently per route, then restore the
             # original row order after both route-specific forwards finish.
             route_values = np.asarray(data.non_tensor_batch["route_id"], dtype=object)
-            unknown_routes = set(str(value) for value in route_values) - {"clean", "masked"}
+            route_order = tuple(
+                str(route)
+                for route in getattr(
+                    intervention_controller, "valid_routes", ("clean", "masked")
+                )
+            )
+            if not route_order or len(set(route_order)) != len(route_order):
+                raise RuntimeError(f"invalid intervention route order: {route_order}")
+            unknown_routes = set(str(value) for value in route_values) - set(route_order)
             if unknown_routes:
                 raise RuntimeError(f"unknown intervention routes: {sorted(unknown_routes)}")
             route_batches = []
             grouped_indices = []
-            for route_name in ("clean", "masked"):
+            for route_name in route_order:
                 route_indices = np.flatnonzero(route_values == route_name)
                 if route_indices.size:
                     route_batches.append((route_name, data.select_idxs(route_indices)))
@@ -567,6 +584,15 @@ class DataParallelPPOActor(BasePPOActor):
         if intervention_controller is not None:
             if "route_id" not in data.non_tensor_batch:
                 raise RuntimeError("MLP intervention actor batch is missing route_id")
+            version_field = getattr(intervention_controller, "batch_version_field", None)
+            if version_field is not None:
+                if version_field not in data.non_tensor_batch:
+                    raise RuntimeError(
+                        f"MLP intervention actor batch is missing {version_field}"
+                    )
+                intervention_controller.validate_batch_version(
+                    data.non_tensor_batch[version_field]
+                )
             non_tensor_select_keys.append("route_id")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
@@ -635,15 +661,23 @@ class DataParallelPPOActor(BasePPOActor):
 
                 if intervention_controller is not None:
                     # Route-homogeneous micro-batches are required because the actor
-                    # controller holds one active structured mask at a time.  Splitting
-                    # before dynamic packing keeps clean and masked forward passes exact.
+                    # controller holds one active intervention at a time. Splitting
+                    # before dynamic packing keeps every route's forward pass exact.
                     route_values = np.asarray(mini_batch.non_tensor_batch["route_id"], dtype=object)
+                    route_order = tuple(
+                        str(route)
+                        for route in getattr(
+                            intervention_controller, "valid_routes", ("clean", "masked")
+                        )
+                    )
+                    if not route_order or len(set(route_order)) != len(route_order):
+                        raise RuntimeError(f"invalid intervention route order: {route_order}")
                     route_batches = []
-                    for route_name in ("clean", "masked"):
+                    for route_name in route_order:
                         route_indices = np.flatnonzero(route_values == route_name)
                         if route_indices.size:
                             route_batches.append(mini_batch.select_idxs(route_indices))
-                    unknown_routes = set(str(value) for value in route_values) - {"clean", "masked"}
+                    unknown_routes = set(str(value) for value in route_values) - set(route_order)
                     if unknown_routes:
                         raise RuntimeError(f"unknown intervention routes: {sorted(unknown_routes)}")
                 else:
@@ -674,13 +708,24 @@ class DataParallelPPOActor(BasePPOActor):
                             raise RuntimeError(f"actor micro-batch mixes intervention routes: {micro_routes}")
                         route_name = micro_routes.pop()
                         route_switch_started = time.perf_counter()
+                        should_collect = getattr(
+                            intervention_controller, "should_collect_activation", None
+                        )
+                        collect_route_activation = (
+                            bool(should_collect(route_name))
+                            if should_collect is not None
+                            else route_name == "clean"
+                        )
                         intervention_controller.set_route(
                             route_name,
                             collect_activation=(
-                                collect_intervention_activation and route_name == "clean"
+                                collect_intervention_activation and collect_route_activation
                             ),
                         )
-                        micro_batch_metrics[f"timing_s/mlp_mask_switch_actor_{route_name}"] = (
+                        metric_prefix = str(
+                            getattr(intervention_controller, "metric_prefix", "mlp_mask")
+                        )
+                        micro_batch_metrics[f"timing_s/{metric_prefix}_switch_actor_{route_name}"] = (
                             time.perf_counter() - route_switch_started
                         )
                     route_update_started = time.perf_counter() if route_name is not None else None

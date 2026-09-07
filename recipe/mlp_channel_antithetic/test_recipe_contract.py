@@ -55,6 +55,9 @@ class AntitheticRecipeContractTest(unittest.TestCase):
         self.assertIn("intervention_controller.set_route(\n                            route_name,", actor)
         self.assertIn("batch_version_field", actor)
         self.assertIn("valid_routes", actor)
+        self.assertIn(
+            'callable(getattr(controller, "set_response_token_mask", None))', actor
+        )
 
     def test_validation_uses_neutral_route(self) -> None:
         worker = (RECIPE_DIR / "worker.py").read_text()

@@ -140,6 +140,7 @@ class DataParallelPPOActor(BasePPOActor):
             controller
             for controller in (intervention_controller, response_activation_controller)
             if controller is not None
+            and callable(getattr(controller, "set_response_token_mask", None))
         ]
         if (
             len(response_layout_controllers) == 2

@@ -85,7 +85,9 @@ class MLPChannelAntitheticController:
         return False
 
     def validate_batch_version(self, values: Any) -> None:
-        versions = torch.as_tensor(values, dtype=torch.int64).view(-1)
+        # Ray may deserialize non-tensor metadata as a read-only NumPy array.
+        # ``torch.tensor`` deliberately copies it, avoiding undefined behavior.
+        versions = torch.tensor(values, dtype=torch.int64).view(-1)
         unique_versions = torch.unique(versions).tolist()
         if unique_versions != [self.perturbation_version]:
             raise RuntimeError(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import warnings
 
 import numpy as np
 import torch
@@ -154,6 +155,17 @@ class AntitheticControllerTest(unittest.TestCase):
         target.validate_batch_version(np.array([23, 23], dtype=np.int64))
         with self.assertRaisesRegex(RuntimeError, "version mismatch"):
             target.validate_batch_version(np.array([22], dtype=np.int64))
+
+    def test_version_validation_accepts_read_only_ray_metadata(self) -> None:
+        controller = MLPChannelAntitheticController(
+            num_layers=1,
+            intermediate_size=8,
+        )
+        versions = np.array([0, 0], dtype=np.int64)
+        versions.flags.writeable = False
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            controller.validate_batch_version(versions)
 
     def test_actor_gain_buffer_is_reused_and_updated_in_place(self) -> None:
         controller = MLPChannelAntitheticController(

@@ -14,7 +14,10 @@ from recipe.mlp_channel_antithetic.intervention import (
     install_hf_mlp_intervention,
     install_vllm_mlp_intervention,
 )
-from recipe.mlp_channel_antithetic.routing import assign_antithetic_routes
+from recipe.mlp_channel_antithetic.routing import (
+    assign_antithetic_routes,
+    copy_prompt_uids_for_generation,
+)
 
 
 class _DenseMLP(nn.Module):
@@ -214,6 +217,18 @@ class AntitheticControllerTest(unittest.TestCase):
             self.assertEqual(int(np.sum(selected == POSITIVE_ROUTE)), 2)
             self.assertEqual(int(np.sum(selected == NEGATIVE_ROUTE)), 2)
         np.testing.assert_array_equal(uids, ["a", "a", "b", "a", "b", "b", "a", "b"])
+
+    def test_prompt_uids_are_copied_for_sync_generation(self) -> None:
+        uids = np.array(["a", "b"], dtype=object)
+        copied = copy_prompt_uids_for_generation(uids, expected_size=2)
+        np.testing.assert_array_equal(copied, uids)
+        self.assertFalse(np.shares_memory(copied, uids))
+
+    def test_prompt_uid_copy_rejects_wrong_batch_size(self) -> None:
+        with self.assertRaisesRegex(ValueError, "matching the generation batch size"):
+            copy_prompt_uids_for_generation(
+                np.array(["a", "b"], dtype=object), expected_size=3
+            )
 
     def test_route_assignment_rejects_unpaired_prompt(self) -> None:
         with self.assertRaisesRegex(ValueError, "even count"):

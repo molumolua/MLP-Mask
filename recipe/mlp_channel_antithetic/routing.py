@@ -7,6 +7,24 @@ import numpy as np
 from .intervention import NEGATIVE_ROUTE, POSITIVE_ROUTE
 
 
+def copy_prompt_uids_for_generation(
+    uids: np.ndarray, *, expected_size: int
+) -> np.ndarray:
+    """Copy prompt identities into the synchronous generation batch.
+
+    The base PPO trainer keeps ``uid`` with reward-model metadata and therefore
+    omits it from synchronous generation batches. Antithetic routing needs the
+    original identity after rollout repetition so it can pair rows per prompt.
+    """
+    values = np.asarray(uids, dtype=object)
+    if values.ndim != 1 or len(values) != expected_size:
+        raise ValueError(
+            "prompt uid must be a one-dimensional array matching the generation "
+            f"batch size ({expected_size}); got shape {values.shape}"
+        )
+    return values.copy()
+
+
 def assign_antithetic_routes(uids: np.ndarray) -> np.ndarray:
     """Assign an equal +/- quota inside every original prompt group."""
     values = np.asarray(uids, dtype=object)

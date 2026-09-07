@@ -15,10 +15,28 @@ from verl.utils.seqlen_balancing import (
 )
 
 from .intervention import NEGATIVE_ROUTE, POSITIVE_ROUTE, TRAINING_ROUTES
+from .routing import copy_prompt_uids_for_generation
 
 
 class MLPChannelAntitheticTrainer(RayPPOTrainer):
     """Standard GRPO over one prompt group containing both symmetric routes."""
+
+    def _get_gen_batch(self, batch: DataProto) -> DataProto:
+        """Preserve prompt identity required by the synchronous rollout worker."""
+        if "uid" not in batch.non_tensor_batch:
+            raise RuntimeError("antithetic trainer batch is missing the original prompt uid")
+        prompt_uids = copy_prompt_uids_for_generation(
+            batch.non_tensor_batch["uid"], expected_size=len(batch)
+        )
+
+        gen_batch = super()._get_gen_batch(batch)
+        if len(gen_batch) != len(prompt_uids):
+            raise RuntimeError(
+                "generation batch size changed while preserving antithetic prompt uid: "
+                f"uids={len(prompt_uids)}, generation_rows={len(gen_batch)}"
+            )
+        gen_batch.non_tensor_batch["uid"] = prompt_uids
+        return gen_batch
 
     def _validate_recipe_contract(self) -> None:
         config = self.config

@@ -38,6 +38,8 @@ class AntitheticRecipeContractTest(unittest.TestCase):
         ).read_text()
         self.assertIn('prompts.non_tensor_batch["route_id"] = routes', worker)
         self.assertNotIn('non_tensor_batch["uid"] =', worker)
+        self.assertIn("def _get_gen_batch(self, batch: DataProto)", trainer)
+        self.assertIn('gen_batch.non_tensor_batch["uid"] = prompt_uids', trainer)
         self.assertNotIn("loss_group_id", worker)
         self.assertNotIn("loss_group_id", trainer)
         self.assertIn(

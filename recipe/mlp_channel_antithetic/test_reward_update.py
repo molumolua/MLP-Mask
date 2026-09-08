@@ -23,6 +23,7 @@ from .reward_update import (
     estimate_channel_direction,
     prepare_reward_difference,
     resolve_down_projection_shards,
+    summarize_step_metrics,
 )
 
 
@@ -108,6 +109,77 @@ def test_invalid_batches_are_rejected_before_training():
     batch.non_tensor_batch["perturbation_version"][0] = 1
     with pytest.raises(ValueError, match="one perturbation"):
         prepare_reward_difference(batch, RewardUpdateConfig(True))
+
+
+def test_reward_metrics_separate_cancellation_from_no_signal():
+    batch = DataProto.from_dict(
+        tensors={"token_level_scores": torch.tensor([[1.], [0.], [0.], [1.]])},
+        non_tensors={
+            "uid": np.array(["a", "a", "b", "b"], dtype=object),
+            "route_id": np.array(["positive", "negative"] * 2, dtype=object),
+            "perturbation_version": np.zeros(4, dtype=np.int64),
+        },
+    )
+    metrics = prepare_reward_difference(batch, RewardUpdateConfig(True))
+    prefix = "mlp_antithetic/reward_update/"
+    assert metrics[prefix + "reward_gap_abs"] == 0
+    assert metrics[prefix + "prompt_gap_abs_mean"] == 1
+    assert metrics[prefix + "prompt_gap_cancellation"] == 1
+    assert metrics[prefix + "prompt_gap_nonzero_fraction"] == 1
+    assert metrics[prefix + "reward_gap_standard_error"] == 1
+    assert metrics[prefix + "reward_gap_standard_error_available"] == 1
+    batch.batch["token_level_scores"].zero_()
+    metrics = prepare_reward_difference(batch, RewardUpdateConfig(True))
+    assert metrics[prefix + "prompt_gap_abs_mean"] == 0
+    assert metrics[prefix + "prompt_gap_cancellation"] == 0
+    assert metrics[prefix + "prompt_gap_nonzero_fraction"] == 0
+
+
+@pytest.mark.parametrize("rewards,same_sign,both_nonzero", [
+    ([1., 0., 0., 1.], 0, 1),
+    ([1., 0., 1., 0.], 1, 1),
+    ([0., 0., 0., 0.], 0, 0),
+])
+def test_split_half_metrics_use_original_generation_order(rewards, same_sign, both_nonzero):
+    batch = DataProto.from_dict(
+        tensors={"token_level_scores": torch.tensor(rewards).unsqueeze(1)},
+        non_tensors={
+            "uid": np.array(["a"] * 4, dtype=object),
+            "route_id": np.array(["positive", "negative"] * 2, dtype=object),
+            "perturbation_version": np.zeros(4, dtype=np.int64),
+            "antithetic_rollout_order": np.arange(4),
+        },
+    )
+    metrics = prepare_reward_difference(batch, RewardUpdateConfig(True))
+    prefix = "mlp_antithetic/reward_update/"
+    assert metrics[prefix + "split_half_available"] == 1
+    assert metrics[prefix + "split_half_same_sign"] == same_sign
+    assert metrics[prefix + "split_half_both_nonzero"] == both_nonzero
+    assert metrics[prefix + "reward_gap_standard_error_available"] == 0
+    batch.reorder(torch.tensor([2, 0, 1, 3]))
+    assert prepare_reward_difference(batch, RewardUpdateConfig(True)) == metrics
+    batch.non_tensor_batch.pop("antithetic_rollout_order")
+    assert prepare_reward_difference(batch, RewardUpdateConfig(True))[prefix + "split_half_available"] == 0
+
+
+@pytest.mark.parametrize("cosine", [1., 0., -1.])
+def test_update_metrics_explain_parallel_orthogonal_and_opposing_steps(cosine):
+    # A main norm of 2 and actual auxiliary norm of .1 consume all of rho=.05.
+    main = torch.tensor([4.], dtype=torch.float64)
+    raw = torch.tensor([1.], dtype=torch.float64)
+    actual = torch.tensor([0.01], dtype=torch.float64)
+    dot = torch.tensor([0.2 * cosine], dtype=torch.float64)
+    scales = torch.tensor([0.1], dtype=torch.float64)
+    metrics = summarize_step_metrics(main, raw, actual, dot, scales, scales, 0.05)
+    prefix = "mlp_antithetic/reward_update/"
+    assert metrics[prefix + "aux_main_cosine"] == pytest.approx(cosine)
+    assert metrics[prefix + "raw_ratio"] == pytest.approx(0.5)
+    assert metrics[prefix + "actual_ratio"] == pytest.approx(0.05)
+    assert metrics[prefix + "budget_utilization"] == pytest.approx(1)
+    assert metrics[prefix + "aux_parallel_ratio"] == pytest.approx(0.05 * cosine)
+    assert metrics[prefix + "aux_orthogonal_ratio"] == pytest.approx(0.05 if cosine == 0 else 0)
+    assert metrics[prefix + "opposing_layer_fraction"] == float(cosine < 0)
+    assert metrics[prefix + "alignment_available"] == 1
 
 
 def test_bfloat16_effective_delta_and_label_exchange_invariance():
@@ -198,6 +270,7 @@ def test_actual_post_adam_update_is_capped_and_momentum_untouched(gap, aux_lr):
     baseline.step()
     updater.begin_batch({"reward_gap": gap, "version": 0}, np.array([0, 0]))
     optimizer.step()
+    main_vectors, auxiliary_vectors = [], []
     for (name, actual), expected in zip(model.named_parameters(), reference.parameters()):
         if "down_proj" not in name:
             assert torch.equal(actual, expected)
@@ -205,6 +278,8 @@ def test_actual_post_adam_update_is_capped_and_momentum_untouched(gap, aux_lr):
         layer = int(name.split(".")[1])
         pg = expected.detach() - original[name]
         aux = actual.detach() - expected.detach()
+        main_vectors.append(pg.flatten())
+        auxiliary_vectors.append(aux.flatten())
         assert aux.norm() <= config.max_update_ratio * pg.norm() * (1 + 1e-12)
         estimated = estimate_channel_direction(controller, gap, torch.bfloat16)[0][layer]
         raw = aux_lr * original[name] * estimated
@@ -214,6 +289,9 @@ def test_actual_post_adam_update_is_capped_and_momentum_untouched(gap, aux_lr):
         for key, value in baseline.state[expected].items():
             assert torch.equal(optimizer.state[actual][key], value)
     assert updater.last_metrics["mlp_antithetic/reward_update/max_layer_ratio"] <= 0.05 * (1 + 1e-12)
+    main_vector, auxiliary_vector = torch.cat(main_vectors), torch.cat(auxiliary_vectors)
+    cosine = float(main_vector.dot(auxiliary_vector) / (main_vector.norm() * auxiliary_vector.norm()))
+    assert updater.last_metrics["mlp_antithetic/reward_update/aux_main_cosine"] == pytest.approx(cosine)
     assert not updater.snapshots
     updater.end_batch()
 
@@ -227,6 +305,10 @@ def test_zero_gap_avoids_weight_snapshots_and_collectives():
         optimizer.step()
     assert not updater.snapshots
     assert updater.last_metrics["mlp_antithetic/reward_update/applied"] == 0
+    assert updater.last_metrics["mlp_antithetic/reward_update/skipped_zero_gap"] == 1
+    assert updater.last_metrics["mlp_antithetic/reward_update/optimizer_step_executed"] == 1
+    assert updater.last_metrics["mlp_antithetic/reward_update/update_metrics_available"] == 0
+    assert updater.last_metrics["mlp_antithetic/reward_update/alignment_available"] == 0
     updater.end_batch()
 
 
@@ -241,6 +323,8 @@ def test_zero_main_step_suppresses_auxiliary_even_with_reward_gap():
     optimizer.step()
     assert all(torch.equal(a, b) for a, b in zip(before, model.parameters()))
     assert updater.last_metrics["mlp_antithetic/reward_update/actual_ratio"] == 0
+    assert updater.last_metrics["mlp_antithetic/reward_update/update_metrics_available"] == 1
+    assert updater.last_metrics["mlp_antithetic/reward_update/alignment_available"] == 0
     updater.end_batch()
 
 

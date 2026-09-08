@@ -78,6 +78,9 @@ def _run_distributed(rank, world_size, rendezvous):
                     main_norm = (base.double() - old[name].double()).norm()
                     assert aux_norm <= 0.05 * main_norm * (1 + 1e-10), strategy
             assert updater.last_metrics["mlp_antithetic/reward_update/max_layer_ratio"] <= 0.05
+            for name in ("aux_main_cosine", "aux_parallel_ratio", "aux_orthogonal_ratio", "budget_utilization", "raw_ratio"):
+                key = f"mlp_antithetic/reward_update/{name}"
+                assert updater.last_metrics[key] == pytest.approx(reference_updater.last_metrics[key], abs=1e-6), strategy
             updater.close()
             reference_updater.close()
             dist.barrier()

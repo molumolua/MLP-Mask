@@ -21,6 +21,54 @@ from .intervention import NEGATIVE_ROUTE, POSITIVE_ROUTE
 REWARD_UPDATE_METADATA = "mlp_antithetic_reward_difference"
 _WEIGHT_RE = re.compile(r"(?:^|\.)(?:layers|h)\.(\d+)\.mlp\.down_proj\.weight$")
 _PREFIX = "mlp_antithetic/reward_update"
+_STEP_METRICS = (
+    "update_metrics_available", "alignment_available", "main_down_proj_norm",
+    "raw_aux_down_proj_norm", "aux_down_proj_norm", "raw_ratio", "actual_ratio",
+    "max_layer_ratio", "budget_utilization", "active_layer_fraction",
+    "clipped_layer_fraction", "rounding_backtrack_fraction", "aux_main_cosine",
+    "opposing_layer_fraction", "aux_parallel_ratio", "aux_orthogonal_ratio",
+)
+
+
+def summarize_step_metrics(main_sq, raw_sq, actual_sq, main_aux_dot, initial_scales, scales, ratio):
+    """Summarize globally reduced squared norms/dots in the down-proj subspace.
+
+    Zero denominators use zero placeholders with explicit availability flags.
+    Cosines use actual representable updates, including rounding/backtracking.
+    """
+    main_total, actual_total = main_sq.sum(), actual_sq.sum()
+    main_norm, auxiliary_norm = main_total.sqrt(), actual_total.sqrt()
+    valid_main = main_total > 0
+    valid_alignment = valid_main & (actual_total > 0)
+    actual_ratio = torch.where(valid_main, auxiliary_norm / main_norm.clamp_min(1e-150), 0)
+    cosine = torch.where(
+        valid_alignment,
+        main_aux_dot.sum() / (main_norm * auxiliary_norm).clamp_min(1e-300),
+        0,
+    ).clamp(-1, 1)
+    layer_ratios = torch.where(main_sq > 0, (actual_sq / main_sq.clamp_min(1e-300)).sqrt(), 0)
+    active_layers = (main_sq > 0) & (actual_sq > 0)
+    values = {
+        "update_metrics_available": torch.ones_like(main_total),
+        "alignment_available": valid_alignment.double(),
+        "main_down_proj_norm": main_norm,
+        "raw_aux_down_proj_norm": raw_sq.sum().sqrt(),
+        "aux_down_proj_norm": auxiliary_norm,
+        "raw_ratio": torch.where(valid_main, raw_sq.sum().sqrt() / main_norm.clamp_min(1e-150), 0),
+        "actual_ratio": actual_ratio,
+        "max_layer_ratio": layer_ratios.max(),
+        "budget_utilization": actual_ratio / ratio,
+        "active_layer_fraction": (actual_sq > 0).double().mean(),
+        "clipped_layer_fraction": (raw_sq > ratio ** 2 * main_sq).double().mean(),
+        "rounding_backtrack_fraction": (scales < initial_scales).double().mean(),
+        "aux_main_cosine": cosine,
+        "opposing_layer_fraction": ((main_aux_dot < 0) & active_layers).double().sum()
+        / active_layers.double().sum().clamp_min(1),
+        "aux_parallel_ratio": actual_ratio * cosine,
+        "aux_orthogonal_ratio": actual_ratio * (1 - cosine.square()).clamp_min(0).sqrt(),
+    }
+    numbers = torch.stack(list(values.values())).cpu().tolist()
+    return {f"{_PREFIX}/{name}": float(value) for name, value in zip(values, numbers)}
 
 
 @dataclass(frozen=True)
@@ -68,6 +116,8 @@ def prepare_reward_difference(batch, config: RewardUpdateConfig) -> dict[str, fl
     for i, uid in enumerate(uids):
         groups.setdefault(uid, []).append(i)
     positive, negative = [], []
+    split_gaps = [[], []]
+    rollout_order = batch.non_tensor_batch.get("antithetic_rollout_order")
     for indices in groups.values():
         idx = np.asarray(indices)
         pos = scores[idx[routes[idx] == POSITIVE_ROUTE]]
@@ -76,8 +126,22 @@ def prepare_reward_difference(batch, config: RewardUpdateConfig) -> dict[str, fl
             raise ValueError("reward difference requires equal nonzero +/- counts for every prompt")
         positive.append(float(pos.mean()))
         negative.append(float(neg.mean()))
+        if rollout_order is not None and len(pos) >= 2:
+            # Use the original generation order, not the length-dependent DP
+            # balancing order. Never split based on rewards or response length.
+            ordered = idx[np.argsort(np.asarray(rollout_order)[idx])]
+            pos_ordered = scores[ordered[routes[ordered] == POSITIVE_ROUTE]]
+            neg_ordered = scores[ordered[routes[ordered] == NEGATIVE_ROUTE]]
+            for half in (0, 1):
+                split_gaps[half].append(float(pos_ordered[half::2].mean() - neg_ordered[half::2].mean()))
     mean_pos, mean_neg = float(np.mean(positive)), float(np.mean(negative))
     gap = mean_pos - mean_neg
+    prompt_gaps = np.asarray(positive) - np.asarray(negative)
+    abs_mean = float(np.abs(prompt_gaps).mean())
+    se_available = len(groups) >= 2
+    standard_error = float(prompt_gaps.std(ddof=1) / math.sqrt(len(groups))) if se_available else 0.0
+    split_available = len(split_gaps[0]) == len(groups)
+    split_first, split_second = (float(np.mean(part)) for part in split_gaps) if split_available else (0.0, 0.0)
     batch.meta_info[REWARD_UPDATE_METADATA] = {
         "reward_gap": gap,
         "version": int(versions[0]),
@@ -87,6 +151,17 @@ def prepare_reward_difference(batch, config: RewardUpdateConfig) -> dict[str, fl
         f"{_PREFIX}/reward_negative": mean_neg,
         f"{_PREFIX}/reward_gap": gap,
         f"{_PREFIX}/prompt_count": float(len(groups)),
+        f"{_PREFIX}/reward_gap_abs": abs(gap),
+        f"{_PREFIX}/prompt_gap_abs_mean": abs_mean,
+        f"{_PREFIX}/prompt_gap_nonzero_fraction": float(np.mean(prompt_gaps != 0)),
+        f"{_PREFIX}/prompt_gap_cancellation": max(0.0, 1 - abs(gap) / abs_mean) if abs_mean else 0.0,
+        f"{_PREFIX}/reward_gap_standard_error": standard_error,
+        f"{_PREFIX}/reward_gap_standard_error_available": float(se_available),
+        f"{_PREFIX}/split_half_available": float(split_available),
+        f"{_PREFIX}/split_half_gap_first": split_first,
+        f"{_PREFIX}/split_half_gap_second": split_second,
+        f"{_PREFIX}/split_half_both_nonzero": float(split_first != 0 and split_second != 0),
+        f"{_PREFIX}/split_half_same_sign": float(split_first * split_second > 0),
     }
 
 
@@ -246,10 +321,14 @@ class RewardDifferenceUpdater:
         )
         self.step_count = 0
         self.last_metrics = {
+            **{f"{_PREFIX}/{name}": 0.0 for name in _STEP_METRICS},
             f"{_PREFIX}/effective_strength": delta,
             f"{_PREFIX}/directional_derivative": slope,
             f"{_PREFIX}/max_update_ratio": self.config.max_update_ratio,
             f"{_PREFIX}/applied": 0.0,
+            f"{_PREFIX}/optimizer_step_executed": 0.0,
+            f"{_PREFIX}/skipped_zero_gap": float(slope == 0),
+            f"{_PREFIX}/time_s": 0.0,
         }
 
     def end_batch(self):
@@ -272,6 +351,14 @@ class RewardDifferenceUpdater:
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
         return stats
 
+    def _raw_update(self, shard, old):
+        # Keep the original snapshot to measure actual PG/auxiliary alignment.
+        # Recompute one shard's raw update at a time instead of retaining a
+        # second model-sized set of snapshots. Arithmetic matches the updater.
+        raw = old.clone()
+        shard.multiply_channels_(raw, self.direction[shard.layer])
+        return raw.mul_(self.config.learning_rate)
+
     @torch.no_grad()
     def _before_step(self, optimizer, args, kwargs):
         if self.direction is None:
@@ -289,19 +376,20 @@ class RewardDifferenceUpdater:
     @torch.no_grad()
     def _after_step(self, optimizer, args, kwargs):
         started = time.perf_counter()
+        self.last_metrics[f"{_PREFIX}/optimizer_step_executed"] = 1.0
         if not torch.count_nonzero(self.direction):
             self.last_metrics[f"{_PREFIX}/time_s"] = time.perf_counter() - started
             return
         layers = self.controller.num_layers
         stats = torch.zeros((layers, 3), dtype=torch.float64, device=self._device())
-        # Reuse old-weight snapshots as raw V storage after measuring Adam's step.
+        # Retain old weights for measuring the actual PG/auxiliary dot product.
         for shard, old in self.snapshots:
             current = shard.tensor()
             stats[shard.layer, 0] += torch.linalg.vector_norm(current - old, dtype=torch.float64).square().to(stats.device)
-            shard.multiply_channels_(old, self.direction[shard.layer])
-            old.mul_(self.config.learning_rate)
-            stats[shard.layer, 1] += torch.linalg.vector_norm(old, dtype=torch.float64).square().to(stats.device)
+            raw = self._raw_update(shard, old)
+            stats[shard.layer, 1] += torch.linalg.vector_norm(raw, dtype=torch.float64).square().to(stats.device)
             stats[shard.layer, 2] += old.numel()
+            del raw
         self._sum(stats)
         if not torch.isfinite(stats).all() or (stats[:, 2] <= 0).any():
             raise RuntimeError("nonfinite or incomplete distributed reward update statistics")
@@ -314,14 +402,20 @@ class RewardDifferenceUpdater:
         # Bound the ACTUAL representable addition too. Rounding can otherwise
         # exceed rho even with FP32 master weights. Backtrack before any write.
         for attempt in range(9):
-            actual_sq = torch.zeros(layers, dtype=torch.float64, device=stats.device)
+            actual_stats = torch.zeros((layers, 2), dtype=torch.float64, device=stats.device)
             scale_values = scales.cpu().tolist()
-            for shard, raw in self.snapshots:
+            for shard, old in self.snapshots:
+                if scale_values[shard.layer] == 0:
+                    continue
                 current = shard.tensor()
-                candidate = current + raw * scale_values[shard.layer]
-                actual_sq[shard.layer] += torch.linalg.vector_norm(candidate - current, dtype=torch.float64).square().to(stats.device)
-            self._sum(actual_sq)
-            actual_sq /= replication
+                raw = self._raw_update(shard, old)
+                auxiliary = (current + raw * scale_values[shard.layer]) - current
+                actual_stats[shard.layer, 0] += torch.linalg.vector_norm(auxiliary, dtype=torch.float64).square().to(stats.device)
+                actual_stats[shard.layer, 1] += (auxiliary * (current - old)).sum(dtype=torch.float64).to(stats.device)
+                del raw, auxiliary
+            self._sum(actual_stats)
+            actual_sq = actual_stats[:, 0] / replication
+            main_aux_dot = actual_stats[:, 1] / replication
             excessive = actual_sq > budget_sq
             if not excessive.any():
                 break
@@ -329,22 +423,20 @@ class RewardDifferenceUpdater:
         # If a representable step still cannot fit, leave that layer unchanged.
         scales[excessive] = 0
         actual_sq[excessive] = 0
+        main_aux_dot[excessive] = 0
         scale_values = scales.cpu().tolist()
-        for shard, raw in self.snapshots:
+        for shard, old in self.snapshots:
             if scale_values[shard.layer] != 0:
                 current = shard.tensor()
+                raw = self._raw_update(shard, old)
                 current.copy_(current + raw * scale_values[shard.layer])
+                del raw
         self.snapshots.clear()
-        ratios = torch.where(main_sq > 0, (actual_sq / main_sq.clamp_min(1e-300)).sqrt(), 0)
-        values = torch.stack((main_sq.sum().sqrt(), actual_sq.sum().sqrt(), ratios.max(), (raw_sq > budget_sq).double().mean(), (scales < initial_scales).double().mean())).cpu().tolist()
-        main_norm, auxiliary_norm, max_ratio, clipped, rounded = values
+        self.last_metrics.update(summarize_step_metrics(
+            main_sq, raw_sq, actual_sq, main_aux_dot, initial_scales, scales,
+            self.config.max_update_ratio,
+        ))
         self.last_metrics.update({
-            f"{_PREFIX}/main_down_proj_norm": main_norm,
-            f"{_PREFIX}/aux_down_proj_norm": auxiliary_norm,
-            f"{_PREFIX}/actual_ratio": auxiliary_norm / main_norm if main_norm else 0.0,
-            f"{_PREFIX}/max_layer_ratio": max_ratio,
-            f"{_PREFIX}/clipped_layer_fraction": clipped,
-            f"{_PREFIX}/rounding_backtrack_fraction": rounded,
-            f"{_PREFIX}/applied": float(auxiliary_norm > 0),
+            f"{_PREFIX}/applied": float(self.last_metrics[f"{_PREFIX}/aux_down_proj_norm"] > 0),
             f"{_PREFIX}/time_s": self._snapshot_time + time.perf_counter() - started,
         })

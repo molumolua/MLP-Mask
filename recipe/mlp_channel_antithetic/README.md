@@ -125,13 +125,41 @@ FSDP1/FSDP2 使用本地权重分片，不 all-gather 完整模型；开启时�
 width、FP32/FP64 optimizer master weights，以及相同的 actor/rollout 计算 dtype。
 不支持 LoRA 或含多个 Shard placement 的 DTensor 布局；不满足条件时明确报错。
 
-所有诊断位于 `mlp_antithetic/reward_update/`：
+所有诊断位于 `mlp_antithetic/reward_update/`。建议按下表建立 W&B 面板；表中省略这个公共前缀。
 
-- `reward_positive`、`reward_negative`、`reward_gap`、`prompt_count`；
-- `effective_strength`、`directional_derivative`、`max_update_ratio`；
-- 非零 reward 差且 optimizer 执行时的 `main_down_proj_norm`、`aux_down_proj_norm`、
-  `actual_ratio`、`max_layer_ratio`、`clipped_layer_fraction`、`rounding_backtrack_fraction`；
-- `applied` 和 optimizer hook 的 `time_s`（不包含生成或主 backward）。
+| 要判断的问题 | 主要指标 | 怎样解读 |
+| --- | --- | --- |
+| 两侧 reward 是否有区别？ | `reward_gap_abs`、`prompt_gap_abs_mean` | 前者是 batch 平均 reward 差的绝对值，后者是逐题差的绝对值再平均；两者都小，说明这一批可用的差分较弱。 |
+| 各题偏好的方向是否互相抵消？ | `prompt_gap_cancellation`、`prompt_gap_nonzero_fraction` | cancellation 为 `1-abs(mean(gap))/mean(abs(gap))`；接近 1 表示抵消明显。所有逐题差为零时定义为 0，需结合 nonzero_fraction 区分没有差异和抵消。 |
+| 胜出方向是否容易被采样改变？ | `split_half_gap_first`、`split_half_gap_second`、`split_half_same_sign` | 在相同 prompt 上将每侧已有 rollout 按原始生成顺序交替分成两份，分别估计 batch reward 差。长期频繁反号，说明方向信号不稳定；不增加 rollout。 |
+| 逐题差的均值有多不稳定？ | `reward_gap_standard_error` | `std(prompt_gaps, ddof=1)/sqrt(prompt_count)`；同时包含题目差异和采样噪声，不是单纯的 rollout 噪声估计，也不是因果效应显著性检验。 |
+| 辅助学习率是否已经被比例上限限制？ | `raw_ratio`、`clipped_layer_fraction` | raw_ratio 是候选辅助范数/主更新范数；多数层触发截断时，再增大辅助 lr 的作用有限。它的数值允许超过 0.05。 |
+| 辅助更新真正用了多少预算？ | `actual_ratio`、`max_layer_ratio`、`budget_utilization` | 前两项都应不超过设定的 ratio；utilization=`actual_ratio/max_update_ratio`，例如 0.6 表示实际使用了 5% 上限中的 60%，即约 3%。 |
+| 辅助项在加强主方向，还是改变主方向？ | `aux_main_cosine`、`aux_parallel_ratio`、`aux_orthogonal_ratio` | cosine 正值表示同向，负值表示相反，接近 0 表示正交；parallel_ratio=`actual_ratio*cosine`，orthogonal_ratio=`actual_ratio*sqrt(1-cosine^2)`。正交分量衡量超出主更新方向的改变量。 |
+| 有多少层生效或与主更新冲突？ | `active_layer_fraction`、`opposing_layer_fraction` | active_fraction 以全部层为分母；opposing_fraction 以主更新和辅助更新均非零的层为分母，统计内积为负的比例。 |
+| 比例偏低是否由精度或跳步造成？ | `rounding_backtrack_fraction`、`skipped_zero_gap`、`optimizer_step_executed`、`applied` | 分别对应浮点舍入触发缩步、reward 差为零、主 optimizer 是否执行、辅助项是否实际写入。 |
+
+**有效性标记必须一起看：** `update_metrics_available=0` 表示跳过了权重快照/范数测量，
+此时更新范数、比例和夹角等字段写 0 只是占位，不能解释成测得主更新为零。
+`alignment_available=1` 时夹角才有定义。`split_half_available=1` 要求每道题每侧至少
+有两条 rollout，并保留原始生成顺序；`split_half_both_nonzero` 区分反号和零信号，
+两份均为零不会记作方向一致。standard error 仅在 `reward_gap_standard_error_available=1`
+（至少两道题）时有定义。主更新范数为零时，raw_ratio/actual_ratio 也使用 0 占位。
+
+所有更新范数与夹角均在 **down_proj 参数子空间** 内计算；夹角使用实际可表示、经过
+舍入和缩步后的辅助更新，而非原始梯度。跨 rank 汇总内积和平方范数，并修正复制分片，
+不平均各 rank 的局部 cosine。保留原有一份旧权重分片快照，按需重算单个分片的候选项，
+因此不额外保存整套主更新张量；开启时增加少量张量运算与标量统计通信，关闭时这些指标
+和运算一并跳过。`time_s` 记录 optimizer hook 的主机墙钟时间，不包含主 Adam 步、生成
+或主 backward；它不是精确的 CUDA kernel profiler。
+
+此外仍记录 `reward_positive`、`reward_negative`、`reward_gap`、`prompt_count`、
+`effective_strength`、`directional_derivative`、`max_update_ratio`、`main_down_proj_norm`、
+`raw_aux_down_proj_norm` 和 `aux_down_proj_norm`。每步方向会刷新，所以 signed reward_gap
+的长期均值接近零并不自动表示无信号；优先结合绝对差和 split-half 结果判断。
+
+这些是机制诊断：split-half 同号不能证明方向可泛化，负 cosine 也不自动表示有害。
+最终收益仍需要与关闭辅助更新的匹配实验比较 neutral validation 的 reward/pass@k。
 
 开启时默认实验名增加 learning rate 和 ratio 后缀，避免自动恢复到关闭辅助更新的实验。
 显式设置 `experiment_name` 会覆盖默认命名。辅助更新没有额外跨步动量或状态，结果直接

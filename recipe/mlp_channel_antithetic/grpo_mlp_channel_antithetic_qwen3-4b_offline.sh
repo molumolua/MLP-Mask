@@ -17,6 +17,14 @@ ref_offload=${ref_offload:-True}
 n_total=${n_total:-16}
 perturbation_strength=${perturbation_strength:-0.10}
 random_seed=${random_seed:-42}
+reward_update_enabled=${reward_update_enabled:-False}
+reward_update_lr=${reward_update_lr:-1e-3}
+reward_update_ratio=${reward_update_ratio:-0.05}
+case "${reward_update_enabled}" in
+    True|true|1) reward_update_enabled=True ;;
+    False|false|0) reward_update_enabled=False ;;
+    *) echo "reward_update_enabled must be True or False" >&2; exit 2 ;;
+esac
 
 if (( n_total < 2 || n_total % 2 != 0 )); then
     echo "n_total must be an even integer >= 2, got: ${n_total}" >&2
@@ -43,7 +51,11 @@ TRAIN_FILE=${TRAIN_FILE:-./data/MATH7500-train.parquet}
 TEST_FILE=${TEST_FILE:-'["./data/aime25_test.parquet","./data/bbeh_data.parquet","./data/MATH500-test.parquet","./data/amc23_test.parquet","./data/aime24_test.parquet","./data/MMLU-Pro-Valid.parquet"]'}
 
 project_name=${project_name:-MLP-Channel-Antithetic-4B}
-experiment_name=${experiment_name:-"grpo-${model_name}-antithetic-sigma${perturbation_strength}-n${n_total}"}
+default_experiment_name="grpo-${model_name}-antithetic-sigma${perturbation_strength}-n${n_total}"
+if [[ "${reward_update_enabled}" == "True" ]]; then
+    default_experiment_name+="-reward-update-lr${reward_update_lr}-ratio${reward_update_ratio}"
+fi
+experiment_name=${experiment_name:-${default_experiment_name}}
 export WANDB_RUN_ID=${WANDB_RUN_ID:-${experiment_name}}
 CKPTS_DIR=${CKPTS_DIR:-${RAY_DATA_HOME}/ckpts/${project_name}/${experiment_name}}
 
@@ -117,6 +129,9 @@ python_bin=${python_bin:-/opt/homebrew/Caskroom/miniconda/base/envs/molu/bin/pyt
     actor_rollout_ref.mlp_channel_antithetic.perturbation_strength=${perturbation_strength} \
     actor_rollout_ref.mlp_channel_antithetic.random_seed=${random_seed} \
     actor_rollout_ref.mlp_channel_antithetic.refresh_every_step=True \
+    actor_rollout_ref.mlp_channel_antithetic.reward_difference_update.enabled=${reward_update_enabled} \
+    actor_rollout_ref.mlp_channel_antithetic.reward_difference_update.learning_rate=${reward_update_lr} \
+    actor_rollout_ref.mlp_channel_antithetic.reward_difference_update.max_update_ratio=${reward_update_ratio} \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     algorithm.norm_adv_by_std_in_grpo=True \

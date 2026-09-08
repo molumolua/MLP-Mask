@@ -3,6 +3,8 @@
 这是一个独立 recipe。它只依赖 verl 核心组件，不导入 `recipe/` 下的任何其他实验。
 默认实验对象是 dense Qwen3-4B，训练数据和六个验证集与 DenoiseRL 的对应脚本一致。
 
+研究动机、核心假设、方案取舍、实验矩阵与成功判据见 [DESIGN.md](./DESIGN.md)。
+
 ## 实验目标
 
 在同一个 policy step 中同时优化两条路径：

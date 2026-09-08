@@ -1,5 +1,8 @@
 # Hard MLP-channel consistency GRPO
 
+完整的问题定义、研究假设、设计取舍、实验矩阵和成败判据见
+[`DESIGN.md`](./DESIGN.md)。本文档侧重当前实现、启动方式与指标说明。
+
 这个独立 recipe 保持 rollout、old-log-prob、GRPO actor loss 和 validation 全部为
 clean policy。每个 optimizer step 只在 actor 内增加一次 teacher-forced auxiliary
 pass：每个 Transformer block 随机 hard-mask 精确 10% SwiGLU channels，并最小化

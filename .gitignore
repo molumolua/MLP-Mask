@@ -25,3 +25,15 @@ ckpts/
 wandb/
 outputs/
 checkpoints/
+
+# Generated PDFs and PDF build/render artifacts
+*.pdf
+/output/pdf/
+/tmp/pdfs/
+
+# Local design notes and paper analysis
+/docs/paper_analysis_sparse_subnetworks_and_caneft.md
+/recipe/mlp_channel_antithetic/DESIGN.md
+/recipe/mlp_channel_consistency/DESIGN.md
+/recipe/mlp_channel_mask/DESIGN.md
+/recipe/mlp_channel_rarity/DESIGN.md

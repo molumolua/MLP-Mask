@@ -16,6 +16,7 @@ from verl.utils.seqlen_balancing import (
 
 from .intervention import NEGATIVE_ROUTE, POSITIVE_ROUTE, TRAINING_ROUTES
 from .routing import copy_prompt_uids_for_generation
+from .reward_update import RewardUpdateConfig, prepare_reward_difference
 
 
 class MLPChannelAntitheticTrainer(RayPPOTrainer):
@@ -41,6 +42,9 @@ class MLPChannelAntitheticTrainer(RayPPOTrainer):
     def _validate_recipe_contract(self) -> None:
         config = self.config
         intervention = config.actor_rollout_ref.mlp_channel_antithetic
+        self.reward_update_config = RewardUpdateConfig.from_config(
+            intervention.get("reward_difference_update", None)
+        )
         if not intervention.get("enabled", False):
             raise ValueError("mlp_channel_antithetic.enabled must be true")
         strength = float(intervention.get("perturbation_strength", 0.10))
@@ -198,3 +202,9 @@ class MLPChannelAntitheticTrainer(RayPPOTrainer):
     def fit(self):
         self._validate_recipe_contract()
         return super().fit()
+
+    def _prepare_actor_update(self, batch: DataProto, metrics) -> None:
+        # The disabled branch does not inspect rewards or create batch metadata.
+        if not self.reward_update_config.active:
+            return
+        metrics.update(prepare_reward_difference(batch, self.reward_update_config))

@@ -27,6 +27,7 @@ from .intervention import (
     install_vllm_mlp_intervention,
 )
 from .routing import assign_antithetic_routes
+from .reward_update import REWARD_UPDATE_METADATA, RewardDifferenceUpdater, RewardUpdateConfig
 
 _STATE_FILE = "mlp_channel_antithetic.pt"
 
@@ -93,6 +94,42 @@ class MLPChannelAntitheticActorRolloutRefWorker(ActorRolloutRefWorker):
         )
         install_hf_mlp_intervention(actor_model, self.actor_mlp_controller)
         self.actor.intervention_controller = self.actor_mlp_controller
+        update_config = RewardUpdateConfig.from_config(
+            self._intervention_config().get("reward_difference_update", None)
+        )
+        if update_config.active:
+            from verl.utils.torch_dtypes import PrecisionType
+
+            if not self.config.actor.get("force_on_policy", False) or int(self.config.actor.ppo_epochs) != 1:
+                raise ValueError("reward difference updates require one complete-batch optimizer step")
+            if self._is_lora:
+                raise NotImplementedError("reward difference updates require full down-projection weights, not LoRA")
+            mixed_precision = self.config.actor.fsdp_config.get("mixed_precision", None) or {}
+            compute_dtype = PrecisionType.to_dtype(mixed_precision.get("param_dtype", "bf16"))
+            if compute_dtype != PrecisionType.to_dtype(self.config.rollout.dtype):
+                raise ValueError("reward difference updates require identical actor/rollout compute dtypes")
+            self.reward_difference_updater = RewardDifferenceUpdater(
+                self.actor_module_fsdp, self.actor_optimizer, self.actor_mlp_controller,
+                update_config, compute_dtype=compute_dtype,
+            )
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    def update_actor(self, data: DataProto):
+        updater = getattr(self, "reward_difference_updater", None)
+        if updater is None:
+            return super().update_actor(data)
+        updater.begin_batch(
+            data.meta_info.get(REWARD_UPDATE_METADATA),
+            data.non_tensor_batch["perturbation_version"],
+        )
+        try:
+            # Optimizer hooks run inside the base worker's loaded-parameter and
+            # Ulysses contexts, before scheduler/offload/checkpoint operations.
+            output = super().update_actor(data)
+            output.meta_info.setdefault("metrics", {}).update(updater.last_metrics)
+            return output
+        finally:
+            updater.end_batch()
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
     def generate_sequences(self, prompts: DataProto) -> DataProto:

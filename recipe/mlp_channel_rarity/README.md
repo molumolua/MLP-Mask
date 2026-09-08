@@ -3,6 +3,8 @@
 这个 recipe 在标准 GRPO 的 actor old-log-prob 前向中读取 prompt token 的
 post-gate SwiGLU 激活，不增加第二次模型前向，也不修改 rollout policy。
 
+从研究动机、设计取舍到实验归因的完整说明见 [方案分析](./DESIGN.md)。
+
 ## 每一步的定义
 
 对问题 `q`、层 `l`、channel `j`，首先对 prompt token 做 RMS：

@@ -13,6 +13,12 @@ actor_rollout_ref:
     perturbation_strength: 0.10
     random_seed: 42
     refresh_every_step: true
+    # Optional reward finite-difference update, applied AFTER Adam.
+    reward_difference_update:
+      enabled: false
+      learning_rate: 1.0e-3
+      # Per-layer auxiliary norm / actual GRPO update norm upper bound.
+      max_update_ratio: 0.05
 
   actor:
     # One update over the complete paired batch, using route-correct behavior probs.

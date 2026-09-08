@@ -64,7 +64,15 @@ top_p=${top_p:-1.0}
 top_k=${top_k:--1}
 val_temperature=${val_temperature:-0.6}
 val_top_p=${val_top_p:-0.95}
-python_bin=${python_bin:-/opt/homebrew/Caskroom/miniconda/base/envs/molu/bin/python}
+# Keep the Linux training host's Python default and this Mac's documented Conda
+# interpreter. An explicit python_bin override takes precedence on either host.
+if [[ -z "${python_bin:-}" ]]; then
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        python_bin=/opt/homebrew/Caskroom/miniconda/base/envs/molu/bin/python
+    else
+        python_bin=python
+    fi
+fi
 
 "${python_bin}" -m recipe.mlp_channel_antithetic.main \
     data.train_files="${TRAIN_FILE}" \

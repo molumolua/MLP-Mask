@@ -179,3 +179,6 @@ RUN_REWARD_UPDATE_DISTRIBUTED_TESTS=1 ./scripts/test-local \
 第一版有意限制为 synchronous vLLM、rollout DP=1、PP=1、偶数 `rollout.n`、无 critic、
 无 reference KL、单 PPO epoch。完整 CUDA 训练需要 Linux GPU 环境；macOS 本地仅验证
 控制器、路由分配和 source/config contract。
+
+启动脚本在 Linux 默认使用 `python`，在本机 macOS 默认使用 AGENTS.md 指定的 `molu`
+Conda 解释器；显式设置 `python_bin` 可覆盖解释器选择。

@@ -75,6 +75,7 @@ def test_launchers_resolve_real_hydra_arguments_and_keep_controls_distinct(tmp_p
             assert c.trainer.total_epochs == 2
             assert c.actor_rollout_ref.actor.ppo_max_token_len_per_gpu == 4096
             assert c.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu == 8192
+            assert "rdrop-cross" in c.trainer.experiment_name
             names.append(c.trainer.experiment_name)
     assert len(set(names)) == 3
 

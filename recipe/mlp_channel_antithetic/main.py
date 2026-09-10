@@ -16,6 +16,7 @@ from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 
 from .trainer import MLPChannelAntitheticTrainer
+from .cross_kl_config import validate_cross_kl_config
 
 
 @hydra.main(config_path="config", config_name="ppo_mlp_channel_antithetic", version_base=None)
@@ -46,6 +47,7 @@ class MLPChannelAntitheticTaskRunner:
         )
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
+        validate_cross_kl_config(config)
 
         if config.actor_rollout_ref.actor.strategy not in {"fsdp", "fsdp2"}:
             raise NotImplementedError("the recipe supports FSDP/FSDP2 actors only")

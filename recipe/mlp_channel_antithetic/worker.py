@@ -16,6 +16,8 @@ from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.profiler.performance import reduce_timing
 from verl.utils.ray_utils import get_event_loop
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
+from verl.workers.actor.dp_actor import DataParallelPPOActor
+from verl.utils.config import omega_conf_to_dataclass
 
 from .intervention import (
     NEGATIVE_ROUTE,
@@ -28,8 +30,15 @@ from .intervention import (
 )
 from .routing import assign_antithetic_routes
 from .reward_update import REWARD_UPDATE_METADATA, RewardDifferenceUpdater, RewardUpdateConfig
+from .actor import AntitheticCrossKLActorMixin
+from .cross_kl_config import validate_cross_kl_worker_config
+from .diagnostics import SampledGradientTracker
 
 _STATE_FILE = "mlp_channel_antithetic.pt"
+
+
+class MLPChannelAntitheticCrossKLActor(AntitheticCrossKLActorMixin, DataParallelPPOActor):
+    pass
 
 
 class MLPChannelAntitheticActorRolloutRefWorker(ActorRolloutRefWorker):
@@ -85,6 +94,7 @@ class MLPChannelAntitheticActorRolloutRefWorker(ActorRolloutRefWorker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
+        validate_cross_kl_worker_config(self.config)
         super().init_model()
         if not self._is_actor:
             return
@@ -94,6 +104,22 @@ class MLPChannelAntitheticActorRolloutRefWorker(ActorRolloutRefWorker):
         )
         install_hf_mlp_intervention(actor_model, self.actor_mlp_controller)
         self.actor.intervention_controller = self.actor_mlp_controller
+        cross_kl = self._intervention_config().get("cross_route_kl", None)
+        if cross_kl is not None and cross_kl.get("enabled", False):
+            for module in actor_model.modules():
+                if isinstance(module, torch.nn.Dropout):
+                    module.p = 0.0
+            self.actor = MLPChannelAntitheticCrossKLActor(
+                config=omega_conf_to_dataclass(self.config.actor),
+                actor_module=self.actor_module_fsdp,
+                actor_optimizer=self.actor_optimizer,
+            )
+            tracker = SampledGradientTracker(
+                self.actor_module_fsdp,
+                sample_size_per_rank=int(cross_kl.gradient_sample_size_per_rank),
+                random_seed=int(self._intervention_config().random_seed) + 1_000_003 + self.rank,
+            )
+            self.actor.configure_cross_kl(cross_kl, self.actor_mlp_controller, tracker)
         update_config = RewardUpdateConfig.from_config(
             self._intervention_config().get("reward_difference_update", None)
         )

@@ -48,6 +48,97 @@ perturbation_strength=0.02 random_seed=7 n_total=16 \
   bash recipe/mlp_channel_antithetic/grpo_mlp_channel_antithetic_qwen3-4b_offline.sh
 ```
 
+## 新入口：正负路由交叉 KL
+
+在 antithetic 的两路 gain 上加入 detached-teacher forward KL，沿用 8+8 条 rollout：
+
+```bash
+bash recipe/mlp_channel_antithetic/grpo_mlp_channel_antithetic_qwen3-4b_cross_kl_offline.sh
+```
+
+这个入口启用 `cross_route_kl.enabled=true`，并强制
+`reward_difference_update.enabled=false`。原来的 reward 差分统计、post-Adam optimizer
+hook 和辅助 `down_proj` 写回均不会执行；配置校验也禁止同时启用这两个辅助机制。
+原始入口和 `reward_update` 入口仍默认关闭交叉 KL。
+
+每条回答都在自身的 prompt 和已生成 response 前缀上对齐：
+
+```text
+positive 生成的 8 条：KL(stop_gradient(P_positive) || P_negative)
+negative 生成的 8 条：KL(stop_gradient(P_negative) || P_positive)
+
+L_aux = (sum_positive_tokens(KL_positive_to_negative)
+       + sum_negative_tokens(KL_negative_to_positive)) / all_response_token_count
+L_total = L_PPO + cross_kl_coef * L_aux
+```
+
+PPO 的聚合沿用 antithetic 原实现，不增加 route loss 分组或改变主损失权重；同一
+prompt 的 16 条回答继续共享 GRPO uid。辅助 KL 按全局有效 response token 数归一化，
+修正 FSDP 的 rank 梯度平均。teacher 分布直接从生成路由的 PPO forward 中缓存，
+PPO backward 后，只额外执行对侧路由的一次 forward/backward；所有梯度累积完成后
+统一 clipping 和 Adam 更新。A/B 使用的是同一份参数的两条 gain 路径。
+
+默认 `cross_kl_top_k=64`：每个位置从生成轨迹的 teacher 分布选 top-64，余下词表
+概率用一个精确 logsumexp tail 聚合。teacher 的概率和 token IDs 均 detach，student
+在相同类别上计算 forward KL。`cross_kl_top_k=0` 可使用完整词表。
+动态 batching 下辅助调用次数跨 rank 对齐，缺少子批次的 rank 做零权重重放；重放不
+计入实际对齐的回答数或 KL 均值。反向完成前固定对应 gain，支持 checkpoint 重算。
+
+常用覆盖：
+
+```bash
+cross_kl_coef=0.01 cross_kl_top_k=64 \
+cross_kl_micro_batch_size_per_gpu=1 cross_kl_token_chunk_size=128 \
+  bash recipe/mlp_channel_antithetic/grpo_mlp_channel_antithetic_qwen3-4b_cross_kl_offline.sh
+```
+
+新脚本默认 4 GPUs、FSDP2 full sharding、SP=1、无原生 dropout/entropy/reference KL，
+沿用原入口的参数和 optimizer offload（默认 `offload=True`），可按显存预算覆盖。
+只支持 dense 全参数、同步
+single-turn vLLM、一个完整 batch 一次 PPO 更新、sampling top-p=1/top-k=-1。
+默认实验名包含 `cross-kl`、KL 系数、top-k 和 seed，使用独立的默认 checkpoint 目录。
+可追加 Hydra 参数，例如 `trainer.total_training_steps=2`；新入口始终关闭旧辅助更新。
+
+主要指标前缀为 `mlp_antithetic/cross_kl/`：
+
+| 指标 | 含义 |
+| --- | --- |
+| `kl`、`weighted_kl_step`、`main_pg_loss_step` | 全局 KL 均值、加权辅助项、原 PPO 主损失 |
+| `positive_to_negative_kl`、`negative_to_positive_kl` | 各来源轨迹上的 forward KL token 均值 |
+| `aligned_response_rows`、`positive_to_negative_aligned_rows`、`negative_to_positive_aligned_rows` | 总对齐条数和各方向条数，默认每 prompt 16/8/8 |
+| `aux_to_main_loss_abs_ratio` | 加权辅助 loss 与主 loss 的绝对值比值 |
+| `main_grad_rms_sampled`、`aux_grad_rms_sampled`、`aux_to_main_grad_ratio_sampled` | 主/加权辅助梯度 RMS 及比值 |
+| `main_aux_grad_cosine_sampled`、`main_aux_grad_angle_degrees_sampled` | 累积主、辅助梯度的余弦与角度 |
+| `grad_angle_defined`、`grad_ratio_defined`、`loss_ratio_denominator_near_zero` | 零范数或主 loss 接近零时的有效性标记 |
+| `auxiliary_forward_calls`、`auxiliary_backward_calls`、`auxiliary_padding_slots` | 额外模型调用数和零权重补齐子批次数，跨 rank 求和 |
+| `teacher_cache_peak_tokens` | 单个 PPO micro-batch 的 teacher 缓存 token 数峰值 |
+
+梯度统计在 clipping 前对全部 micro-batches 先累积再比较，默认每 rank 抽样 262144
+个固定参数坐标；包含 KL 系数。这些是梯度关系，原 `reward_update` 的指标则衡量
+post-Adam 实际参数写回，二者口径不同。
+
+计时指标 `timing_s/mlp_antithetic_cross_kl_auxiliary_step` 记录各 rank 累积 student
+辅助阶段耗时的最大值；`timing_s/mlp_antithetic_cross_kl_teacher_capture_step` 单独
+记录 PPO forward 内的 teacher 分布缓存构建。两者使用主机 wall-clock，受 CUDA 异步
+执行影响；整体开销应结合 `timing_s/update_actor` 和 `timing_s/step` 判断。
+每条轨迹额外一次 forward/backward，粗略模型计算量约为无辅助版本的 2 倍，非实测耗时。
+
+缓存覆盖的是当前**主损失 micro-batch** 的有效 response tokens；辅助 micro-batch=1
+只限制 student 计算。Qwen3-4B 每 4096 token 的 top-64 teacher 缓存含 IDs 约 3.02 MiB，
+完整词表约 2.32 GiB，均不包含模型激活、完整 logits 和梯度临时张量。
+
+交叉 KL 本地验证：
+
+```bash
+./scripts/test-local recipe/mlp_channel_antithetic -q
+RUN_CROSS_KL_DISTRIBUTED_TESTS=1 ./scripts/test-local \
+  recipe/mlp_channel_antithetic/test_cross_kl_distributed.py -q
+```
+
+覆盖正负 gain 下的 detached-teacher 梯度 oracle、teacher 缓存复用、top-k/tail
+有限差分、原 PPO 聚合保持不变、双 rank 不等长批次和补齐、真实 bash 配置展开及旧辅助
+关闭。CPU 测试使用小模型，实际 FSDP2/vLLM CUDA 训练仍需在 GPU 主机验证。
+
 ## 可选：reward 差分驱动的辅助 channel 更新
 
 默认关闭，继续运行原有 antithetic GRPO。关闭时不计算 reward 差分、不安装 optimizer

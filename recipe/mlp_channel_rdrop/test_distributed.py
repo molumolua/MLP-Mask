@@ -32,11 +32,14 @@ def run_rank(rank, world, rendezvous):
         assert metrics["mlp_rdrop/main_pg_loss_step"][0] == pytest.approx(float(main), abs=1e-6)
         assert metrics["mlp_rdrop/weighted_kl_step"][0] == pytest.approx(float(auxiliary), abs=1e-7)
         assert metrics["mlp_rdrop/aligned_response_rows"] == [16]
+        assert metrics["mlp_rdrop/a_to_b_aligned_rows"] == [8]
+        assert metrics["mlp_rdrop/b_to_a_aligned_rows"] == [8]
+        assert metrics["mlp_rdrop/auxiliary_forward_calls"] == metrics["mlp_rdrop/auxiliary_backward_calls"]
         assert metrics["mlp_rdrop/auxiliary_padding_slots"][0] > 0
         dist.barrier()
 
         # Parameter diagnostics use actual DTensor shards, not duplicated full
-        # parameters. Three of eight coordinates differ from the pre-RL weights.
+        # parameters. Three of sixteen coordinates differ from the pre-RL weights.
         mesh = init_device_mesh("cpu", (world,))
         module = torch.nn.Module()
         module.weight = torch.nn.Parameter(distribute_tensor(torch.zeros(8, 2), mesh, [Shard(0)]))

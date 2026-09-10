@@ -19,6 +19,15 @@ actor_rollout_ref:
       learning_rate: 1.0e-3
       # Per-layer auxiliary norm / actual GRPO update norm upper bound.
       max_update_ratio: 0.05
+    # Optional KL(detached source || opposite route), using the PPO teacher.
+    # Enable with the cross_kl launcher; mutually exclusive with reward updates.
+    cross_route_kl:
+      enabled: false
+      kl_coef: 0.01
+      kl_top_k: 64
+      kl_token_chunk_size: 128
+      micro_batch_size_per_gpu: 1
+      gradient_sample_size_per_rank: 262144
 
   actor:
     # One update over the complete paired batch, using route-correct behavior probs.

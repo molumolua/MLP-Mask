@@ -8,12 +8,19 @@
 
 | 内容 | 完整词表 | top-64 + tail（默认） |
 | --- | ---: | ---: |
-| 一个 4096-token response 的 FP32 分布 | 2.32 GiB | 1.02 MiB |
-| A/B 两份分布以及共用 token IDs | 4.64 GiB | 4.03 MiB |
+| 一个 4096-token response 的 teacher FP32 分布 | 2.32 GiB | 1.02 MiB |
+| teacher 分布及其 token IDs | 2.32 GiB | 3.02 MiB |
 
 完整词表单份计算式为 `4096 * 151936 * 4 bytes`。压缩版本单份概率为
-`4096 * 65 * 4 bytes`，两路共用的 int64 token IDs 为 `4096 * 64 * 8 bytes`。
-默认逐条对齐，不会同时缓存全部 16 条轨迹的两路分布。
+`4096 * 65 * 4 bytes`，teacher 选择的 int64 token IDs 为 `4096 * 64 * 8 bytes`。
+当前版本只缓存生成路由的 detached teacher 分布，student 分布按 token chunk 临时计算。
+
+**缓存大小由主损失 micro-batch 决定，不能只看辅助 micro-batch=1。** teacher 复用 PPO
+前向，因此保存该主损失 micro-batch 的全部有效 response tokens。设总数为 `T`，
+完整词表缓存约 `T * 151936 * 4 bytes`，top-64 缓存（含 IDs）约 `T * 772 bytes`。
+例如主损失一次处理两条 4096-token 回答，分别约 4.64 GiB 或 6.03 MiB。
+辅助子批次只切片复用这些缓存，不复制整个分布；下一个主损失 micro-batch 前释放。
+可用 `mlp_rdrop/teacher_cache_peak_tokens` 观察实际 `T` 的峰值。
 
 top-k 降低跨 forward 保存的分布内存，但仍需正常模型 forward 和词表归一化。
 例如 12288-token 的单条序列，未经 response 切片的 BF16 logits 本身约 **3.48 GiB**；
@@ -52,24 +59,31 @@ CPU RAM 和带宽需求会明显增加。上述 CPU 配置是工程建议，不�
 | --- | ---: |
 | 普通 GRPO | `F + 2F = 3F` |
 | 原 clean→masked consistency | 主损失 `3F` + masked `3F` = `6F` |
-| 当前两路 R-Drop | 主损失 `3F` + no-grad A `F` + B `3F` + A replay `3F` = `10F` |
+| 旧版逐轨迹双侧对称 KL | 主损失 `3F` + no-grad A `F` + B `3F` + A replay `3F` = `10F` |
+| 当前交叉 KL | 主损失 `3F`（复用 teacher 分布）+ 对侧 student `3F` = `6F` |
 
-因此 actor 更新计算量约为普通 GRPO 的 **3.3 倍**，约为原单向 consistency 的
-**1.7 倍**。这是 FLOP 级近似：checkpoint 重算、小 batch 利用率、词表 KL、
-FSDP 通信、动态批次的零权重重放都会影响真实时间，不能直接视为实测倍数。
+当前版本每条轨迹仅额外执行一次对侧 forward 和一次 backward：A 的 8 条让 B 学，
+B 的 8 条让 A 学。actor 更新计算量约为普通 GRPO 的 **2 倍**，与原单向 consistency
+大致同阶；相对旧版 `10F`，约减少 **40%**。单看辅助模型计算，则由 `7F` 降为 `3F`，
+约减少 **57%**。teacher top-k 缓存仍有额外开销，只是无需额外模型前向。
+这是 FLOP 级近似：checkpoint 重算、小 batch 利用率、词表 KL、FSDP 通信、动态
+批次的零权重重放都会影响真实时间，不能直接视为实测倍数。
 
 如果普通 GRPO 中 actor update 占单步时间比例 `f`，假设其它部分时间不变，粗估：
 
 ```text
-new_step_time / baseline_step_time ≈ 1 + (3.33 - 1) * f
-f=20% → 1.47x
-f=40% → 1.93x
+new_step_time / baseline_step_time ≈ 1 + (2 - 1) * f
+f=20% → 1.20x
+f=40% → 1.40x
 ```
 
-例如仅作为换算示例，原来 60 秒/step 且 `f` 在上述区间，对应约 88–116 秒/step；
+例如仅作为换算示例，原来 60 秒/step 且 `f` 在上述区间，对应约 72–84 秒/step；
 这不是本项目测得的绝对时长。生成仍是 16 条，但拆成 A/B 两次调用以及 cache reset
-可能改变吞吐。top-k 显著节省分布缓存，却不会消除这三次辅助 forward 和两次 backward。
+可能改变吞吐。top-k 节省分布缓存，交叉目标及 teacher 复用减少模型计算；两者作用不同。
 
 在目标 GPU 主机上，比较 clean control、no-aux 两 mask control 和默认 recipe 的
-`timing_s/step`、`timing_s/update_actor`、`timing_s/mlp_rdrop_auxiliary_step`，
-避开初始化/编译 warmup，再据实测的秒数规划训练时长。
+`timing_s/step`、`timing_s/update_actor`、`timing_s/mlp_rdrop_auxiliary_step` 和
+`timing_s/mlp_rdrop_teacher_capture_step`。最后一项单独记录 PPO 前向内的 teacher
+分布缓存构建；这部分从旧版辅助阶段移到了主损失前向，比较时不能遗漏。
+阶段指标为主机 wall-clock 耗时，受 CUDA 异步执行影响；整体时间以 trainer 的
+step/update_actor 为准，避开初始化/编译 warmup，再据实测的秒数规划训练时长。

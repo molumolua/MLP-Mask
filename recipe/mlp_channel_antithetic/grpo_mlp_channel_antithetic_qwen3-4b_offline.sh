@@ -20,11 +20,26 @@ random_seed=${random_seed:-42}
 reward_update_enabled=${reward_update_enabled:-False}
 reward_update_lr=${reward_update_lr:-1e-3}
 reward_update_ratio=${reward_update_ratio:-0.05}
+cross_kl_enabled=${cross_kl_enabled:-False}
+cross_kl_coef=${cross_kl_coef:-0.01}
+cross_kl_top_k=${cross_kl_top_k:-64}
+cross_kl_token_chunk_size=${cross_kl_token_chunk_size:-128}
+cross_kl_micro_batch_size_per_gpu=${cross_kl_micro_batch_size_per_gpu:-1}
+cross_kl_gradient_sample_size_per_rank=${cross_kl_gradient_sample_size_per_rank:-262144}
 case "${reward_update_enabled}" in
     True|true|1) reward_update_enabled=True ;;
     False|false|0) reward_update_enabled=False ;;
     *) echo "reward_update_enabled must be True or False" >&2; exit 2 ;;
 esac
+case "${cross_kl_enabled}" in
+    True|true|1) cross_kl_enabled=True ;;
+    False|false|0) cross_kl_enabled=False ;;
+    *) echo "cross_kl_enabled must be True or False" >&2; exit 2 ;;
+esac
+if [[ "${cross_kl_enabled}" == "True" && "${reward_update_enabled}" == "True" ]]; then
+    echo "cross-route KL requires reward_update_enabled=False" >&2
+    exit 2
+fi
 
 if (( n_total < 2 || n_total % 2 != 0 )); then
     echo "n_total must be an even integer >= 2, got: ${n_total}" >&2
@@ -42,8 +57,8 @@ max_prompt_length=${max_prompt_length:-8192}
 max_response_length=${max_response_length:-4096}
 gpu_memory_utilization=${gpu_memory_utilization:-0.7}
 use_dynamic_bsz=${use_dynamic_bsz:-True}
-actor_ppo_max_token_len=$((2 * (max_prompt_length + max_response_length)))
-infer_ppo_max_token_len=$((2 * (max_prompt_length + max_response_length)))
+actor_ppo_max_token_len=${actor_ppo_max_token_len:-$((2 * (max_prompt_length + max_response_length)))}
+infer_ppo_max_token_len=${infer_ppo_max_token_len:-$((2 * (max_prompt_length + max_response_length)))}
 
 RAY_DATA_HOME=${RAY_DATA_HOME:-.}
 MODEL_PATH=${MODEL_PATH:-../Model/Qwen/${model_name}}
@@ -54,6 +69,9 @@ project_name=${project_name:-MLP-Channel-Antithetic-4B}
 default_experiment_name="grpo-${model_name}-antithetic-sigma${perturbation_strength}-n${n_total}"
 if [[ "${reward_update_enabled}" == "True" ]]; then
     default_experiment_name+="-reward-update-lr${reward_update_lr}-ratio${reward_update_ratio}"
+fi
+if [[ "${cross_kl_enabled}" == "True" ]]; then
+    default_experiment_name+="-cross-kl${cross_kl_coef}-top${cross_kl_top_k}-seed${random_seed}"
 fi
 experiment_name=${experiment_name:-${default_experiment_name}}
 export WANDB_RUN_ID=${WANDB_RUN_ID:-${experiment_name}}
@@ -140,6 +158,12 @@ fi
     actor_rollout_ref.mlp_channel_antithetic.reward_difference_update.enabled=${reward_update_enabled} \
     actor_rollout_ref.mlp_channel_antithetic.reward_difference_update.learning_rate=${reward_update_lr} \
     actor_rollout_ref.mlp_channel_antithetic.reward_difference_update.max_update_ratio=${reward_update_ratio} \
+    actor_rollout_ref.mlp_channel_antithetic.cross_route_kl.enabled=${cross_kl_enabled} \
+    actor_rollout_ref.mlp_channel_antithetic.cross_route_kl.kl_coef=${cross_kl_coef} \
+    actor_rollout_ref.mlp_channel_antithetic.cross_route_kl.kl_top_k=${cross_kl_top_k} \
+    actor_rollout_ref.mlp_channel_antithetic.cross_route_kl.kl_token_chunk_size=${cross_kl_token_chunk_size} \
+    actor_rollout_ref.mlp_channel_antithetic.cross_route_kl.micro_batch_size_per_gpu=${cross_kl_micro_batch_size_per_gpu} \
+    actor_rollout_ref.mlp_channel_antithetic.cross_route_kl.gradient_sample_size_per_rank=${cross_kl_gradient_sample_size_per_rank} \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     algorithm.norm_adv_by_std_in_grpo=True \
@@ -161,4 +185,5 @@ fi
     trainer.total_epochs=${epoch} \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.resume_mode=auto \
-    ++trainer.max_actor_ckpt_to_keep=1
+    ++trainer.max_actor_ckpt_to_keep=1 \
+    "$@"

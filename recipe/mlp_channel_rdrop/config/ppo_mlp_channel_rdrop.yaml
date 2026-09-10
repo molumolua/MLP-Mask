@@ -13,7 +13,8 @@ actor_rollout_ref:
     mask_ratio: 0.10
     random_seed: 42
     kl_coef: 0.01
-    # Symmetric KL on mask A's top-k tokens + one exact tail. 0 uses full vocab.
+    # KL(detached source || opposite route), on the source's top-k + exact tail.
+    # 0 uses the full vocabulary. Teacher probabilities reuse the PPO forward.
     kl_top_k: 64
     # These only change the memory schedule.
     micro_batch_size_per_gpu: 1

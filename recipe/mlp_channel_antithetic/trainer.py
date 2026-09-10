@@ -17,6 +17,7 @@ from verl.utils.seqlen_balancing import (
 from .intervention import NEGATIVE_ROUTE, POSITIVE_ROUTE, TRAINING_ROUTES
 from .routing import copy_prompt_uids_for_generation
 from .reward_update import RewardUpdateConfig, prepare_reward_difference
+from .cross_kl_config import validate_cross_kl_config
 
 
 class MLPChannelAntitheticTrainer(RayPPOTrainer):
@@ -41,6 +42,7 @@ class MLPChannelAntitheticTrainer(RayPPOTrainer):
 
     def _validate_recipe_contract(self) -> None:
         config = self.config
+        validate_cross_kl_config(config)
         intervention = config.actor_rollout_ref.mlp_channel_antithetic
         self.reward_update_config = RewardUpdateConfig.from_config(
             intervention.get("reward_difference_update", None)

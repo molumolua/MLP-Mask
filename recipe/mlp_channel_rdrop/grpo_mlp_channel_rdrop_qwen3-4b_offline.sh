@@ -10,7 +10,7 @@ model_name=${model_name:-Qwen3-4B-Base}
 num_gpus=${num_gpus:-4}
 tensor_model_parallel_size=${tensor_model_parallel_size:-1}
 
-# Independent per-layer masks A/B with top-k-plus-tail symmetric KL.
+# Independent masks; each source teaches the opposite route via forward KL.
 auxiliary_enabled=${auxiliary_enabled:-True}
 mask_ratio=${mask_ratio:-0.10}
 random_seed=${random_seed:-42}
@@ -43,7 +43,7 @@ TRAIN_FILE=${TRAIN_FILE:-./data/MATH7500-train.parquet}
 TEST_FILE=${TEST_FILE:-'["./data/aime25_test.parquet","./data/bbeh_data.parquet","./data/MATH500-test.parquet","./data/amc23_test.parquet","./data/aime24_test.parquet","./data/MMLU-Pro-Valid.parquet"]'}
 
 project_name=${project_name:-MLP-Channel-RDrop-4B}
-experiment_name=${experiment_name:-"grpo-${model_name}-rdrop-mask${mask_ratio}-kl${kl_coef}-top${kl_top_k}-n${n_rollouts}-seed${random_seed}"}
+experiment_name=${experiment_name:-"grpo-${model_name}-rdrop-cross-mask${mask_ratio}-kl${kl_coef}-top${kl_top_k}-n${n_rollouts}-seed${random_seed}"}
 export WANDB_RUN_ID=${WANDB_RUN_ID:-${experiment_name}}
 CKPTS_DIR=${CKPTS_DIR:-${RAY_DATA_HOME}/ckpts/${project_name}/${experiment_name}}
 rollout_data_dir=${rollout_data_dir:-${CKPTS_DIR}/rollout_data}

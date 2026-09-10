@@ -13,33 +13,25 @@ from verl import DataProto
 
 from .batching import slice_model_inputs
 from .diagnostics import _all_reduce_sum, _collective_device
-from .intervention import CLEAN_ROUTE, MASK_A_ROUTE, MASK_B_ROUTE, TRAINING_ROUTES
+from .intervention import NEUTRAL_ROUTE, POSITIVE_ROUTE, NEGATIVE_ROUTE, TRAINING_ROUTES
 from .kl import build_distribution, forward_kl_sum, select_response_logits, slice_distribution_rows
 
 
-def prepare_loss_metadata(data: DataProto) -> tuple[float, int]:
-    """Global token means despite unequal response lengths on different ranks.
+def prepare_auxiliary_metadata(data: DataProto) -> tuple[float, int]:
+    """Normalize cross KL globally without changing antithetic's PPO metadata.
 
-    Main = 0.5 mean_A(PPO) + 0.5 mean_B(PPO). Auxiliary = token mean over
-    all A/B trajectories. FSDP averages gradients over ranks, hence the DP factor.
-    GRPO advantage still uses the original shared prompt uid (all 16 answers).
+    The existing PPO objective and shared prompt uid are left intact. FSDP
+    averages gradients over ranks, so KL token sums need the world-size factor.
     """
     routes = np.asarray(data.non_tensor_batch["route_id"], dtype=object)
     if set(routes) != set(TRAINING_ROUTES):
         raise ValueError("every actor shard must contain both training routes")
-    tokens = data.batch["response_mask"].sum(-1).detach().cpu().numpy()
-    local = [float(tokens[routes == route].sum()) for route in TRAINING_ROUTES]
-    global_counts = _all_reduce_sum(local, data.batch["response_mask"].device)
-    if min(global_counts) <= 0:
-        raise ValueError("each route must have valid response tokens")
+    local_tokens = float(data.batch["response_mask"].sum())
+    global_tokens = _all_reduce_sum([local_tokens], data.batch["response_mask"].device)[0]
+    if global_tokens <= 0:
+        raise ValueError("cross-route KL requires valid response tokens")
     world = dist.get_world_size() if dist.is_initialized() else 1
-    weights = np.empty(len(data), dtype=np.float32)
-    for i, route in enumerate(TRAINING_ROUTES):
-        weights[routes == route] = world * local[i] / global_counts[i]
-    data.non_tensor_batch["loss_multiplier"] = weights
-    data.non_tensor_batch["loss_group_id"] = routes.copy()
-    data.non_tensor_batch["loss_group_normalizer"] = np.full(len(data), 2, dtype=np.int64)
-    return world / sum(global_counts), world
+    return world / global_tokens, world
 
 
 def synchronized_auxiliary_slots(batch_size: int, micro_batch_size: int,
@@ -52,18 +44,18 @@ def synchronized_auxiliary_slots(batch_size: int, micro_batch_size: int,
     return int(count.item())
 
 
-class RDropActorMixin:
+class AntitheticCrossKLActorMixin:
     """Mixed into DataParallelPPOActor by the worker; tensor logic is CPU-testable."""
-    def configure_rdrop(self, config, controller, gradient_tracker):
-        self.rdrop_config = config
+    def configure_cross_kl(self, config, controller, gradient_tracker):
+        self.cross_kl_config = config
         self.intervention_controller = controller
         self.gradient_tracker = gradient_tracker
         self.kl_coef = float(config.kl_coef)
-        self.auxiliary_enabled = bool(config.auxiliary_enabled) and self.kl_coef > 0
+        self.auxiliary_enabled = bool(config.enabled) and self.kl_coef > 0
         self.kl_micro_batch_size = int(config.micro_batch_size_per_gpu)
         self.kl_token_chunk_size = int(config.kl_token_chunk_size)
         self.kl_top_k = int(config.kl_top_k)
-        self._rdrop_update_active = False
+        self._cross_kl_update_active = False
 
     def _clear_teacher(self):
         self._teacher_distribution = None
@@ -73,7 +65,7 @@ class RDropActorMixin:
         self._kl_loss = None
 
     def update_policy(self, data: DataProto):
-        self._aux_token_weight, world = prepare_loss_metadata(data)
+        self._aux_token_weight, world = prepare_auxiliary_metadata(data)
         # Each source contributes a single directed KL on its own trajectories.
         self._aux_by_source = {route: [0.0, 0, 0] for route in TRAINING_ROUTES}
         self._aux_padding_slots = 0
@@ -82,7 +74,7 @@ class RDropActorMixin:
         self._aux_seconds = 0.0
         self._teacher_capture_seconds = 0.0
         self._teacher_cache_peak_tokens = 0
-        self._rdrop_update_active = self.auxiliary_enabled
+        self._cross_kl_update_active = self.auxiliary_enabled
         self._clear_teacher()
         self.gradient_tracker.start_update()
         try:
@@ -93,16 +85,16 @@ class RDropActorMixin:
             raise
         finally:
             self._response_logits_callback = None
-            self._rdrop_update_active = False
+            self._cross_kl_update_active = False
             self._clear_teacher()
-            self.intervention_controller.set_route(CLEAN_ROUTE)
+            self.intervention_controller.set_route(NEUTRAL_ROUTE)
 
         # Sum contributions before cross-rank averaging. Ordinary micro-batch
         # metric means are not the complete objective when lengths differ.
         main = sum(float(v) for v in metrics.get("actor/pg_loss", []))
         stats = _all_reduce_sum(
             [main, self._aux_padding_slots, self._aux_forward_calls, self._aux_backward_calls,
-             *self._aux_by_source[MASK_A_ROUTE], *self._aux_by_source[MASK_B_ROUTE]],
+             *self._aux_by_source[POSITIVE_ROUTE], *self._aux_by_source[NEGATIVE_ROUTE]],
             data.batch["response_mask"].device,
         )
         main, padding, forward_calls, backward_calls, a_sum, a_tokens, a_rows, b_sum, b_tokens, b_rows = stats
@@ -116,31 +108,31 @@ class RDropActorMixin:
             dist.all_reduce(maxima, op=dist.ReduceOp.MAX)
         auxiliary_time, teacher_time, cache_tokens = maxima.cpu().tolist()
         diagnostics.update({
-            "mlp_rdrop/main_pg_loss_step": main,
-            "mlp_rdrop/kl": raw,
-            "mlp_rdrop/weighted_kl_step": weighted,
-            "mlp_rdrop/total_loss_step": main + weighted,
-            "mlp_rdrop/aux_to_main_loss_abs_ratio": abs(weighted) / max(abs(main), 1e-12),
-            "mlp_rdrop/loss_ratio_denominator_near_zero": float(abs(main) < 1e-8),
-            "mlp_rdrop/kl_coef": self.kl_coef,
-            "mlp_rdrop/auxiliary_enabled": float(self.auxiliary_enabled),
-            "mlp_rdrop/response_tokens": tokens,
-            "mlp_rdrop/aligned_response_rows": rows,
-            "mlp_rdrop/auxiliary_padding_slots": padding,
-            "mlp_rdrop/auxiliary_forward_calls": forward_calls,
-            "mlp_rdrop/auxiliary_backward_calls": backward_calls,
-            "mlp_rdrop/a_to_b_kl": a_sum / a_tokens if a_tokens else 0.0,
-            "mlp_rdrop/b_to_a_kl": b_sum / b_tokens if b_tokens else 0.0,
-            "mlp_rdrop/a_to_b_aligned_rows": a_rows,
-            "mlp_rdrop/b_to_a_aligned_rows": b_rows,
-            "mlp_rdrop/a_to_b_response_tokens": a_tokens,
-            "mlp_rdrop/b_to_a_response_tokens": b_tokens,
-            "mlp_rdrop/cross_route_forward_kl": 1.0,
-            "mlp_rdrop/teacher_cache_peak_tokens": cache_tokens,
-            "mlp_rdrop/full_vocabulary_kl": float(self.kl_top_k == 0),
-            "mlp_rdrop/kl_top_k": float(self.kl_top_k),
-            "timing_s/mlp_rdrop_auxiliary_step": auxiliary_time,
-            "timing_s/mlp_rdrop_teacher_capture_step": teacher_time,
+            "mlp_antithetic/cross_kl/main_pg_loss_step": main,
+            "mlp_antithetic/cross_kl/kl": raw,
+            "mlp_antithetic/cross_kl/weighted_kl_step": weighted,
+            "mlp_antithetic/cross_kl/total_loss_step": main + weighted,
+            "mlp_antithetic/cross_kl/aux_to_main_loss_abs_ratio": abs(weighted) / max(abs(main), 1e-12),
+            "mlp_antithetic/cross_kl/loss_ratio_denominator_near_zero": float(abs(main) < 1e-8),
+            "mlp_antithetic/cross_kl/kl_coef": self.kl_coef,
+            "mlp_antithetic/cross_kl/auxiliary_enabled": float(self.auxiliary_enabled),
+            "mlp_antithetic/cross_kl/response_tokens": tokens,
+            "mlp_antithetic/cross_kl/aligned_response_rows": rows,
+            "mlp_antithetic/cross_kl/auxiliary_padding_slots": padding,
+            "mlp_antithetic/cross_kl/auxiliary_forward_calls": forward_calls,
+            "mlp_antithetic/cross_kl/auxiliary_backward_calls": backward_calls,
+            "mlp_antithetic/cross_kl/positive_to_negative_kl": a_sum / a_tokens if a_tokens else 0.0,
+            "mlp_antithetic/cross_kl/negative_to_positive_kl": b_sum / b_tokens if b_tokens else 0.0,
+            "mlp_antithetic/cross_kl/positive_to_negative_aligned_rows": a_rows,
+            "mlp_antithetic/cross_kl/negative_to_positive_aligned_rows": b_rows,
+            "mlp_antithetic/cross_kl/positive_to_negative_response_tokens": a_tokens,
+            "mlp_antithetic/cross_kl/negative_to_positive_response_tokens": b_tokens,
+            "mlp_antithetic/cross_kl/cross_route_forward_kl": 1.0,
+            "mlp_antithetic/cross_kl/teacher_cache_peak_tokens": cache_tokens,
+            "mlp_antithetic/cross_kl/full_vocabulary_kl": float(self.kl_top_k == 0),
+            "mlp_antithetic/cross_kl/kl_top_k": float(self.kl_top_k),
+            "timing_s/mlp_antithetic_cross_kl_auxiliary_step": auxiliary_time,
+            "timing_s/mlp_antithetic_cross_kl_teacher_capture_step": teacher_time,
         })
         diagnostics.update(self.intervention_controller.metrics())
         for name, value in diagnostics.items():
@@ -148,7 +140,7 @@ class RDropActorMixin:
         return metrics
 
     def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False):
-        if not getattr(self, "_rdrop_update_active", False):
+        if not getattr(self, "_cross_kl_update_active", False):
             return super()._forward_micro_batch(micro_batch, temperature, calculate_entropy)
 
         routes = {str(route) for route in micro_batch["route_id"]}
@@ -203,7 +195,7 @@ class RDropActorMixin:
         self.gradient_tracker.capture_main_gradient()
         if not self.auxiliary_enabled:
             self.gradient_tracker.capture_auxiliary_gradient()
-            return {"timing_s/mlp_rdrop_auxiliary_micro_batch": 0.0}
+            return {"timing_s/mlp_antithetic_cross_kl_auxiliary_micro_batch": 0.0}
 
         started = time.perf_counter()
         original_route = self.intervention_controller.route
@@ -214,7 +206,7 @@ class RDropActorMixin:
             raise RuntimeError("cross-route KL is missing its PPO teacher cache")
         if self._teacher_route != original_route:
             raise RuntimeError("cross-route KL teacher/source route mismatch")
-        student_route = MASK_B_ROUTE if original_route == MASK_A_ROUTE else MASK_A_ROUTE
+        student_route = NEGATIVE_ROUTE if original_route == POSITIVE_ROUTE else POSITIVE_ROUTE
         slots = synchronized_auxiliary_slots(batch_size, self.kl_micro_batch_size,
                                              model_inputs["responses"].device)
         try:
@@ -254,4 +246,4 @@ class RDropActorMixin:
         self.gradient_tracker.capture_auxiliary_gradient()
         elapsed = time.perf_counter() - started
         self._aux_seconds += elapsed
-        return {"timing_s/mlp_rdrop_auxiliary_micro_batch": elapsed}
+        return {"timing_s/mlp_antithetic_cross_kl_auxiliary_micro_batch": elapsed}

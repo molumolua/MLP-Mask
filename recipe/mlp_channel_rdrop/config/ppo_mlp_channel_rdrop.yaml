@@ -1,0 +1,76 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+actor_rollout_ref:
+  mlp_channel_rdrop:
+    enabled: true
+    auxiliary_enabled: true
+    mask_ratio: 0.10
+    random_seed: 42
+    kl_coef: 0.01
+    # Symmetric KL on mask A's top-k tokens + one exact tail. 0 uses full vocab.
+    kl_top_k: 64
+    # These only change the memory schedule.
+    micro_batch_size_per_gpu: 1
+    kl_token_chunk_size: 128
+    gradient_sample_size_per_rank: 262144
+    parameter_update_diagnostics_enabled: true
+
+  model:
+    use_fused_kernels: false
+    override_config:
+      attention_dropout: 0.0
+      embd_pdrop: 0.0
+      resid_pdrop: 0.0
+      attn_pdrop: 0.0
+
+  actor:
+    strategy: fsdp2
+    force_on_policy: true
+    use_rollout_log_probs: true
+    use_fused_kernels: false
+    ppo_epochs: 1
+    entropy_coeff: 0.0
+    use_kl_loss: false
+    loss_agg_mode: token-mean
+    ulysses_sequence_parallel_size: 1
+    policy_loss:
+      loss_mode: vanilla
+    fsdp_config:
+      fsdp_size: -1
+
+  rollout:
+    name: vllm
+    mode: sync
+    n: 16
+    calculate_log_probs: true
+    enable_prefix_caching: true
+    data_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    top_p: 1.0
+    top_k: -1
+    temperature: 1.0
+    log_prob_use_dynamic_bsz: false
+    log_prob_micro_batch_size_per_gpu: 1
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  rollout_correction:
+    bypass_old_logprob_for_rollout: false
+    rollout_is: null
+    rollout_rs: null
+
+reward_model:
+  reward_manager: naive
+
+trainer:
+  project_name: MLP-Channel-RDrop
+  balance_batch: true
+  merge_duplicate_val_prompts: true
+  validation_pass_reward_threshold: 0.0

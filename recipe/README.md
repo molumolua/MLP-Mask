@@ -8,6 +8,7 @@ The recipe directories correspond to different generations or controls of the me
 | [`denoise_v2`](./denoise_v2) | **Primary** | Current DenoiseRL: recovery-only rollout groups, per-problem adaptive `rho`, line-aligned prefixes, continuation-only loss, and stable-sample replacement. |
 | [`correct_prefix`](./correct_prefix) | Control | Positive-prefix baseline built from verified-correct weak-model trajectories. |
 | [`mlp_channel_antithetic`](./mlp_channel_antithetic) | Experimental | Budget-matched positive/negative MLP-channel gain perturbations with a shared GRPO prompt group and neutral validation. |
+| [`mlp_channel_rdrop`](./mlp_channel_rdrop) | Experimental | Two independent 10% MLP channel masks, 8+8 rollouts, symmetric top-k-plus-tail KL on every response, and parameter/gradient diagnostics. |
 
 `denoise_v3` was an experimental branch and has been removed. It is not part of the current method.
 
